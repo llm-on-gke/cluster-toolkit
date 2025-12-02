@@ -167,6 +167,13 @@ resource "google_container_cluster" "gke_cluster" {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
 
+  dynamic "gateway_api_config" {
+    for_each = var.enable_inference_gateway ? [1] : []
+    content {
+      channel = "CHANNEL_STANDARD"
+    }
+  }
+
   dynamic "authenticator_groups_config" {
     for_each = local.cluster_authenticator_security_group
     content {
@@ -228,6 +235,12 @@ resource "google_container_cluster" "gke_cluster" {
     }
     lustre_csi_driver_config {
       enabled = var.enable_managed_lustre_csi
+    }
+    dynamic "http_load_balancing" {
+      for_each = var.enable_inference_gateway ? [1] : []
+      content {
+        disabled = false
+      }
     }
   }
 
@@ -393,7 +406,7 @@ provider "kubernetes" {
 module "workload_identity" {
   count   = var.configure_workload_identity_sa ? 1 : 0
   source  = "terraform-google-modules/kubernetes-engine/google//modules/workload-identity"
-  version = "~> 34.0"
+  version = ">= 40.0"
 
   use_existing_gcp_sa = true
   name                = var.k8s_service_account_name
@@ -430,7 +443,7 @@ module "kubectl_apply" {
   cluster_id = google_container_cluster.gke_cluster.id
   project_id = var.project_id
 
-  apply_manifests = flatten([
+  apply_manifests = concat(flatten([
     for idx, network_info in local.all_networks : [
       {
         source = "${path.module}/templates/gke-network-paramset.yaml.tftpl",
@@ -446,5 +459,12 @@ module "kubectl_apply" {
         template_vars = { name = network_info.name }
       }
     ]
-  ])
+    ]),
+    var.enable_inference_gateway ? [
+      {
+        source        = "https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/v1.0.0/manifests.yaml",
+        template_vars = {}
+      }
+    ] : []
+  )
 }

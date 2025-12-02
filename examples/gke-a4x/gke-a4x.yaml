@@ -52,15 +52,32 @@ vars:
 
   # Installs NCCL library and Google NCCL plugin
   # Runs an init container on all GB200 GPU nodes with the NCCL plugin image
-  nccl_rdma_installer_path: $(ghpc_stage("./nccl-rdma-installer.yaml"))
+  gib_installer_path: $(ghpc_stage("./nccl-installer.yaml.tftpl"))
   nvidia_dra_driver_path: $(ghpc_stage("./nvidia-dra-driver.yaml"))
   kueue_configuration_path: $(ghpc_stage("./kueue-configuration.yaml.tftpl"))
   accelerator_type: nvidia-gb200
+  version_prefix: "1.33."
+
+  # # To enable Managed-Lustre please uncomment this section and fill out the settings.
+  # # Additionally, please uncomment the private_service_access, lustre_firewall_rule, managed-lustre and lustre-pv modules.
+  # # Managed Lustre is only supported in specific regions and zones
+  # # Please refer https://cloud.google.com/managed-lustre/docs/locations
+
+  # # Managed-Lustre instance name. This should be unique for each deployment.
+  # lustre_instance_id: $(vars.deployment_name)
+
+  # # The values of size_gib and per_unit_storage_throughput are co-related
+  # # Please refer https://cloud.google.com/managed-lustre/docs/create-instance#performance-tiers
+  # # Storage capacity of the lustre instance in GiB
+  # lustre_size_gib: 36000
+
+  # # Maximum throughput of the lustre instance in MBps per TiB
+  # per_unit_storage_throughput: 500
 
 terraform_providers:
   google:
     source: hashicorp/google
-    version: 6.34.0
+    version: 7.2.0
     configuration:
       project: $(vars.project_id)
       region: $(vars.region)
@@ -69,7 +86,7 @@ terraform_providers:
 
   google-beta:
     source: hashicorp/google-beta
-    version: 6.34.0
+    version: 7.2.0
     configuration:
       project: $(vars.project_id)
       region: $(vars.region)
@@ -170,6 +187,7 @@ deployment_groups:
       system_node_pool_taints: []
       enable_dcgm_monitoring: true
       enable_gcsfuse_csi: true
+      enable_managed_lustre_csi: true # Enable Managed Lustre for the cluster
       enable_k8s_beta_apis:
       - "resource.k8s.io/v1beta1/deviceclasses"
       - "resource.k8s.io/v1beta1/resourceclaims"
@@ -181,7 +199,7 @@ deployment_groups:
       master_authorized_networks:
       - cidr_block: $(vars.authorized_cidr)  # Allows your machine to run the kubectl command. Required for multi network setup.
         display_name: "kubectl-access-network"
-      version_prefix: "1.32."
+      version_prefix: $(vars.version_prefix)
       release_channel: RAPID
       maintenance_exclusions:
       - name: no-minor-or-node-upgrades-indefinite
@@ -206,6 +224,48 @@ deployment_groups:
         ))
     outputs: [instructions]
 
+  # # --- MANAGED LUSTRE ADDITIONS ---
+  # # Private Service Access (PSA) requires the compute.networkAdmin role which is
+  # # included in the Owner role, but not Editor.
+  # # PSA is required for all Managed Lustre functionality.
+  # # https://cloud.google.com/vpc/docs/configure-private-services-access#permissions
+  # - id: private_service_access
+  #   source: community/modules/network/private-service-access
+  #   use: [gke-a4x-net-0]
+  #   settings:
+  #     prefix_length: 24
+
+  # # Firewall to allow Managed Lustre connection
+  # - id: lustre_firewall_rule
+  #   source: modules/network/firewall-rules
+  #   use: [gke-a4x-net-0]
+  #   settings:
+  #     ingress_rules:
+  #     - name: $(vars.deployment_name)-allow-lustre-traffic
+  #       description: Allow Managed Lustre traffic
+  #       source_ranges:
+  #       - $(private_service_access.cidr_range)
+  #       allow:
+  #       - protocol: tcp
+  #       ports:
+  #       - "988"
+
+  # - id: managed-lustre
+  #   source: modules/file-system/managed-lustre
+  #   use: [gke-a4x-net-0, private_service_access]
+  #   settings:
+  #     name: $(vars.lustre_instance_id)
+  #     local_mount: /lustre
+  #     remote_mount: lustrefs
+  #     size_gib: $(vars.lustre_size_gib)
+  #     per_unit_storage_throughput: $(vars.per_unit_storage_throughput)
+
+  # - id: lustre-pv
+  #   source: modules/file-system/gke-persistent-volume
+  #   use: [managed-lustre, a4x-cluster]
+  #   settings:
+  #     capacity_gib: $(vars.lustre_size_gib)
+
   - id: workload_policy
     source: modules/compute/resource-policy
     settings:
@@ -229,8 +289,6 @@ deployment_groups:
       guest_accelerator:
       - type: nvidia-gb200
         count: 4
-        gpu_driver_installation_config:
-          gpu_driver_version: DEFAULT
       reservation_affinity:
         consume_reservation_type: SPECIFIC_RESERVATION
         specific_reservations:
@@ -257,6 +315,7 @@ deployment_groups:
     source: modules/management/kubectl-apply
     use: [a4x-cluster]
     settings:
+      target_architecture: "arm64"
       kueue:
         install: true
         config_path: $(vars.kueue_configuration_path)
@@ -267,8 +326,26 @@ deployment_groups:
         install: true
       nvidia_dra_driver:
         install: true
+      gib:
+        install: true  # NCCL gIB plugin via DaemonSet initContainer
+        path: $(vars.gib_installer_path)
+        template_vars:
+          image: "us-docker.pkg.dev/gce-ai-infra/gpudirect-gib/nccl-plugin-gib-arm64"
+          version: v1.0.7
+          accelerator_count: 4
+          node_affinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+              - matchExpressions:
+                - key: cloud.google.com/gke-accelerator
+                  operator: In
+                  values:
+                  - $(vars.accelerator_type)
+                - key: kubernetes.io/arch
+                  operator: In
+                  values:
+                  - arm64
       apply_manifests:
-      - source: $(vars.nccl_rdma_installer_path)
       - source: $(vars.nvidia_dra_driver_path)
 
   - id: job-template
