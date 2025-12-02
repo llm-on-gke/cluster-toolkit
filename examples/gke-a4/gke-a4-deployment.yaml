@@ -16,41 +16,41 @@ terraform_backend_defaults:
   type: gcs
   configuration:
     # The GCS bucket used for storing terraform state
-    bucket:
+    bucket: rick-nemo-factory # replace bucket name
 
 vars:
   # Your GCP Project ID
-  project_id:
+  project_id: supercomputer-testing #replace project name
 
   # This should be unique across all of your Cluster
   # Toolkit Deployments.
-  deployment_name:
+  deployment_name: gke-a4
 
   # The GCP Region used for this deployment.
-  region:
+  region: us-west3
 
   # The GCP Zone used for this deployment.
-  zone:
+  zone: us-west3-b
 
   # The number of nodes to be created.
-  static_node_count:
+  static_node_count: 2
 
   # Cidr block containing the IP of the machine calling terraform.
   # To allow all (IAM restrictions still enforced), use 0.0.0.0/0
   # To allow only your IP address, use <YOUR-IP-ADDRESS>/32
-  authorized_cidr:
+  authorized_cidr: 0.0.0.0/0
 
   # The name of the compute engine reservation in the form of
   # <reservation-name>
   # To target a BLOCK_NAME, the name of the extended reservation
   # can be inputted as <reservation-name>/reservationBlocks/<reservation-block-name>
-  reservation:
+  reservation: nvidia-b200-849dcfj4v4bb2
 
   # The disk size of system node pool for this deployment.
-  system_node_pool_disk_size_gb:
+  system_node_pool_disk_size_gb: 100
 
   # The disk size of a4 node pool for this deployment.
-  a4_node_pool_disk_size_gb:
+  a4_node_pool_disk_size_gb: 200
 
-  enable_periodic_health_checks: # Make this true to run CHS (healthchecks)
-  health_check_schedule: # Run the health check at 12:00 AM (midnight) every Sunday
+  enable_periodic_health_checks: false # Make this true to run CHS (healthchecks)
+  health_check_schedule: "0 0 * * 0" # Run the health check at 12:00 AM (midnight) every Sunday
