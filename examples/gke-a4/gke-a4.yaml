@@ -45,6 +45,7 @@ vars:
 
   kueue_configuration_path: $(ghpc_stage("./kueue-configuration.yaml.tftpl"))
   gib_installer_path: $(ghpc_stage("./nccl-installer.yaml.tftpl"))
+  ray_cluster_path: $(ghpc_stage("./raycluster.yaml.tftpl"))
   system_node_pool_disk_size_gb: 200
   a4_node_pool_disk_size_gb: 100
   accelerator_type: nvidia-b200
@@ -325,6 +326,10 @@ deployment_groups:
           gcs_bucket: $(vars.chs_output_bucket_name)
           gcs_pvc: $(vars.chs_pvc_claim_name)
           cronjob_schedule: $(vars.health_check_schedule)
+      - source: $(vars.ray_cluster_path)
+        enable: true
+        template_vars:
+          replicas: $(vars.static_node_count)
       kueue:
         install: true
         config_path: $(vars.kueue_configuration_path)
