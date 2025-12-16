@@ -42,7 +42,7 @@ vars:
   # To target a BLOCK_NAME, the name of the extended reservation
   # can be inputted as <reservation-name>/reservationBlocks/<reservation-block-name>
   reservation:
-
+  reservation_project:
   kueue_configuration_path: $(ghpc_stage("./kueue-configuration.yaml.tftpl"))
   gib_installer_path: $(ghpc_stage("./nccl-installer.yaml.tftpl"))
   ray_cluster_path: $(ghpc_stage("./raycluster.yaml.tftpl"))
@@ -280,6 +280,7 @@ deployment_groups:
         consume_reservation_type: SPECIFIC_RESERVATION
         specific_reservations:
         - name: $(vars.reservation)
+        - project: $(vars.reservation_project)
       additional_networks:
         $(concat(
           [{

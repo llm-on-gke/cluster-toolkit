@@ -33,7 +33,7 @@ vars:
   zone: us-west3-b
 
   # The number of nodes to be created.
-  static_node_count: 2
+  static_node_count: 1
 
   # Cidr block containing the IP of the machine calling terraform.
   # To allow all (IAM restrictions still enforced), use 0.0.0.0/0
@@ -45,6 +45,7 @@ vars:
   # To target a BLOCK_NAME, the name of the extended reservation
   # can be inputted as <reservation-name>/reservationBlocks/<reservation-block-name>
   reservation: nvidia-b200-849dcfj4v4bb2
+  reservation_project: supercomputer-testing
 
   # The disk size of system node pool for this deployment.
   system_node_pool_disk_size_gb: 100
