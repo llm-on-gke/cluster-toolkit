@@ -334,7 +334,7 @@ resource "google_container_node_pool" "node_pool" {
       condition = (
         (local.input_specific_reservations_count == 0) ||
         (local.input_specific_reservations_count == 1 && length(local.input_reservation_suffixes) == 0) ||
-        (local.input_specific_reservations_count == 1 && length(local.input_reservation_suffixes) > 0 && try(local.input_reservation_projects[0], var.project_id) == var.project_id)
+        (local.input_specific_reservations_count == 1 && length(local.input_reservation_suffixes) > 0 )
       )
       error_message = "Shared extended reservations are not supported by GKE."
     }
