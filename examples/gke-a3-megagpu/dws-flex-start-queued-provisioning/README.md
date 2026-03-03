@@ -15,7 +15,7 @@ Note: If you create multiple clusters using these same cluster blueprints, ensur
 
     ```sh
     cd ~
-    git clone https://github.com/GoogleCloudPlatform/cluster-toolkit.git
+    git clone https://github.com/llm-on-gke/cluster-toolkit.git
     ```
 
 1. Install the Cluster Toolkit:
@@ -40,7 +40,7 @@ Note: If you create multiple clusters using these same cluster blueprints, ensur
     PROJECT_ID: ID of the project where the bucket is being created.\
     COMPUTE_REGION: the compute region where you want to store the state of the Terraform deployment.
 
-1. In the examples/gke-consumption-options/dws-flex-start-queued-provisioning/gke-a3-ultragpu-deployment.yaml file, fill in the following settings in the terraform_backend_defaults and vars sections to match the specific values for your deployment:
+1. In the examples/gke-a3-megagpu/dws-flex-start-queued-provisioning/gke-a3-ultragpu-deployment.yaml file, fill in the following settings in the terraform_backend_defaults and vars sections to match the specific values for your deployment:
 
     `bucket`: the name of the Cloud Storage bucket you created in the previous step.\
     `deployment_name`: the name of the deployment.\
@@ -52,8 +52,8 @@ Note: If you create multiple clusters using these same cluster blueprints, ensur
     `authorized_cidr`: The IP address range that you want to allow to connect with the cluster. This CIDR block must include the IP address of the machine to call Terraform.\
     `system_node_pool_disk_size_gb`: the size of disk for each node of the system node pool. Default value is 100.\
     `system_node_pool_disk_size_gb`: the size of disk for each node of the system node pool. Default value is 100.\
-    `a3ultra_node_pool_disk_size_gb`: the size of disk for each node of the A3 Ultra node pool.\
-    To modify advanced settings, edit examples/gke-consumption-options/dws-flex-start-queued-provisioning/gke-a3-ultragpu.yaml.
+    `a3mega_node_pool_disk_size_gb`: the size of disk for each node of the A3 Ultra node pool.\
+    To modify advanced settings, edit examples/gke-a3-megatpu/dws-flex-start-queued-provisioning/gke-a3-ultragpu.yaml.
 
 1. Generate [Application Default Credentials (ADC)](https://cloud.google.com/docs/authentication/provide-credentials-adc#google-idp) to provide access to Terraform.
 
@@ -65,13 +65,12 @@ Note: If you create multiple clusters using these same cluster blueprints, ensur
 
     ```sh
     cd ~/cluster-toolkit
-    ./gcluster deploy -d \
-    examples/gke-consumption-options/dws-flex-start-queued-provisioning/gke-a3-ultragpu-deployment.yaml \
-    examples/gke-consumption-options/dws-flex-start-queued-provisioning/gke-a3-ultragpu.yaml
+    ./gcluster deploy  \
+    examples/gke-a3-megagpu/dws-flex-start-queued-provisioning/gke-a3-megagpu-dws.yaml \
     ```
 
 1. When prompted, select (A)pply to deploy the blueprint.
-   * The blueprint creates VPC networks, a GPU RDMA VPC network, service accounts, a cluster, and a nodepool.
+   * The blueprint creates VPC networks, 8 GPU VPC network, service accounts, a cluster, and a nodepool.
 
 ## Note
 
@@ -79,11 +78,11 @@ Note: If you create multiple clusters using these same cluster blueprints, ensur
 * To use DWS Flex Start, `auto_repair` should be set to `false`.
 
 Along with these flex start requirements, there are a few queue-provisioning specific requirements.
-* Queued provisioning does not work with `static_node_count` and requires `autoscaling_total_min_nodes` be set to `0`.
+* Queued provisioning requires `autoscaling_total_min_nodes` be set to `0`.
 
 ## Run a job
 
-The dws-flex-start-queued-provisioning example provides a `sample-job.yaml` file that runs a job *similar* to this example: https://cloud.google.com/kubernetes-engine/docs/how-to/provisioningrequest
+The dws-flex-start-queued-provisioning example provides a `nccl-jobset-example.yaml` file that runs a job *similar* to this example: https://cloud.google.com/kubernetes-engine/docs/how-to/provisioningrequest
 
 1. Connect to the GKE cluster using gcloud command.
 
@@ -93,14 +92,6 @@ The dws-flex-start-queued-provisioning example provides a `sample-job.yaml` file
 
     Replace `<cluster-name>` with the name of your cluster, `<location>` with the name of the compute region, and `<project-id>` with the ID of the project.
 
-1. Run the jobs.
-
-    ```sh
-    kubectl apply -f examples/gke-consumption-options/dws-flex-start-queued-provisioning/sample-job.yaml
-    ```
-
-1. Consider using `kubectl get jobs` and `kubectl describe job <job-name>` to get information about the jobs.\
-You can also use `kubectl get pods` and `kubectl describe pod <pod-name>` to get pod information.
 
 ## Deploy and run NCCL test
 
@@ -132,7 +123,7 @@ To validate the functionality of the provisioned cluster, you can run a NCCL tes
     Create the resources to run the test.
 
     ```sh
-    kubectl create -f ~/cluster-toolkit/examples/gke-consumption-options/dws-flex-start/nccl-jobset-example.yaml
+    kubectl create -f ~/cluster-toolkit/examples/gke-a3-megagpu/dws-flex-start/nccl-jobset-example.yaml
     ```
 
     This command returns a JobSet name.
