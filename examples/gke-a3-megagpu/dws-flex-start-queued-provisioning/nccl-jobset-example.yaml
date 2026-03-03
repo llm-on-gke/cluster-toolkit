@@ -1,4 +1,4 @@
-# Copyright 2026 Google Inc. All rights reserved.
+# Copyright 2024 Google Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,82 +15,52 @@
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
-  generateName: ag-2-
-  namespace: default
+  name: nccl-test
   labels:
-    kueue.x-k8s.io/queue-name: dws-local-queue
+       kueue.x-k8s.io/queue-name: dws-local-queue
   annotations:
-    provreq.kueue.x-k8s.io/maxRunDurationSeconds: "600"
+       provreq.kueue.x-k8s.io/maxRunDurationDays: "7"
 spec:
   ttlSecondsAfterFinished: 1200
-  suspend: False
+  suspend: true # DWS
   network:
     enableDNSHostnames: true
   replicatedJobs:
-  - name: w
+  - name: nccl
     template:
       spec:
         parallelism: 2
         completions: 2
-
         template:
           metadata:
-            annotations:
-              networking.gke.io/default-interface: 'eth0'
-              networking.gke.io/interfaces: |
-                [
-                  {"interfaceName":"eth0","network":"default"},
-                  {"interfaceName":"eth1","network":"gvnic-1"},
-                  {"interfaceName":"eth2","network":"rdma-0"},
-                  {"interfaceName":"eth3","network":"rdma-1"},
-                  {"interfaceName":"eth4","network":"rdma-2"},
-                  {"interfaceName":"eth5","network":"rdma-3"},
-                  {"interfaceName":"eth6","network":"rdma-4"},
-                  {"interfaceName":"eth7","network":"rdma-5"},
-                  {"interfaceName":"eth8","network":"rdma-6"},
-                  {"interfaceName":"eth9","network":"rdma-7"}
-                ]
+             annotations:
+              kueue.x-k8s.io/podset-preferred-topology: "kubernetes.io/hostname"
+   
           spec:
             # Limit benchmark run duration
             activeDeadlineSeconds: 3600
             restartPolicy: Never
             nodeSelector:
-              cloud.google.com/gke-nodepool: a3-ultragpu-8g-a3-ultragpu-pool
-              cloud.google.com/gke-flex-start: "true"
+               cloud.google.com/gke-nodepool: a3-megagpu-8g-a3megagpupool #for dws
+               #cloud.google.com/gke-accelerator: nvidia-h100-mega-80gb 
             tolerations:
-            - key: cloud.google.com/gke-queued
-              effect: NoSchedule
-              value: "true"
-
             - key: "nvidia.com/gpu"
               operator: "Exists"
               effect: "NoSchedule"
-
-            setHostnameAsFQDN: true
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            #setHostnameAsFQDN: true
             volumes:
-            - name: gib
-              hostPath:
-                path: /home/kubernetes/bin/gib
             - name: nvidia
               hostPath:
                 path: /home/kubernetes/bin/nvidia
-            - name: lib64
-              hostPath:
-                path: /lib64
             - name: shared-memory
               emptyDir:
                 medium: "Memory"
                 sizeLimit: 250Gi
-            - name: sys
-              hostPath:
-                path: /sys
-            - name: proc-sys
-              hostPath:
-                path: /proc/sys
-
             initContainers:
             - name: gpu-healthcheck
-              image: alpine:latest
+              image: "nvidia/cuda:12.8.1-base-ubuntu20.04" #alpine:latest
               command: ["/bin/sh", "-c"]
               args:
               - |
@@ -116,8 +86,6 @@ spec:
               volumeMounts:
               - name: nvidia
                 mountPath: /usr/local/nvidia
-              - name: lib64
-                mountPath: /lib64
               securityContext:
                 privileged: true
               env:
@@ -125,17 +93,43 @@ spec:
                 value: /usr/local/nvidia/lib64
 
             containers:
+            - name: tcpxo-daemon
+              image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.14
+              imagePullPolicy: Always
+              command: ["/bin/sh", "-c"]
+              args:
+                 - |
+                   set -ex
+                   chmod 755 /fts/entrypoint_rxdm_container.sh
+                   /fts/entrypoint_rxdm_container.sh --num_hops=2 --num_nics=8 --uid= --alsologtostderr
+              securityContext:
+                 privileged: true
+              volumeMounts:
+                - name: nvidia
+                  mountPath: /usr/local/nvidia
+              env:
+                - name: LD_LIBRARY_PATH
+                  value: /usr/local/nvidia/lib64
             - name: nccl
               stdin: true
               tty: true
-              image: us-docker.pkg.dev/gce-ai-infra/gpudirect-gib/nccl-plugin-gib-diagnostic:v1.1.0
+              image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/nccl-plugin-gpudirecttcpx-dev:v1.0.8-1
               securityContext:
                 privileged: true
               env:
-              - name: MY_NODE_NAME
+              - name: LD_LIBRARY_PATH
+                value: /usr/local/nvidia/lib64
+              - name: N_NODES
+                value: "2"
+              - name: hostname_prefix
                 valueFrom:
                   fieldRef:
-                    fieldPath: spec.nodeName
+                    fieldPath: metadata.annotations['jobset.sigs.k8s.io/jobset-name']
+              - name: hostname_suffix
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.annotations['jobset.sigs.k8s.io/replicatedjob-name']
+                
               - name: OMPI_ALLOW_RUN_AS_ROOT
                 value: "1"
               - name: OMPI_ALLOW_RUN_AS_ROOT_CONFIRM
@@ -145,28 +139,30 @@ spec:
               - -c
               - |
                 set -x
-                export N_NODES=2
+        
                 echo "Starting workload container on ${MY_NODE_NAME} for $N_NODES benchmark"
 
                 # Load all the cuda libs
-                /sbin/ldconfig
+                #/sbin/ldconfig
 
                 # Install ping
-                apt update -y
-                apt install -y iputils-ping
+                #apt update -y
+                #apt install -y iputils-ping
 
                 # Start sshd
                 /scripts/container_entry.sh daemon &
-
+                cp /scripts/demo_mpi_entry_with_config_profile.sh /tmp/demo_mpi_entry_with_config_profile.sh
+                echo "source source ${NCCL_LIB_DIR}/nccl-env-profile-ll128.sh" >> /tmp/demo_mpi_entry_with_config_profile.sh
+                chmod +x /tmp/demo_mpi_entry_with_config_profile.sh 
                 # Get helper variables to form all hostnames
-                export POSTFIX=$(hostname | cut -d . -f 2-)
-                export WORKERS_BASENAME=$(hostname | cut -d . -f 1 | rev | cut -d - -f 2- | rev )
+                #export POSTFIX=$(hostname | cut -d . -f 2-)
+                #export WORKERS_BASENAME=$(hostname | cut -d . -f 1 | rev | cut -d - -f 2- | rev )
                 export NODE_RANK=$JOB_COMPLETION_INDEX
 
 
                 # For every worker, wait till online and add to hostfile
                 for i in `seq 0 $(($N_NODES-1))`; do
-                  OTHER=${WORKERS_BASENAME}-${i}.${POSTFIX}
+                  OTHER="${hostname_prefix}-${hostname_suffix}-0-${i}.${hostname_prefix}"
                   until ssh -p 222 -o StrictHostKeyChecking=no $OTHER hostname; do
                     echo Waiting for ${OTHER}...
                     sleep 10
@@ -181,30 +177,48 @@ spec:
 
                     # World Level = 0x0, Rail Aligned = 0x7
                     export NCCL_TESTS_SPLIT_MASK="0x0";
-
+                    
                     # Force use of libnccl-gib
-                    export NCCL_NET=gIB
-
+                    #export NCCL_NET=gIB
+                    export NCCL_LIB_DIR="/usr/local/nvidia/lib64"
                     # Set all the correct libnccl-gib environment variables
-                    source /usr/local/gib/scripts/set_nccl_env.sh
-
+                    #source /usr/local/gib/scripts/set_nccl_env.sh
+                    source ${NCCL_LIB_DIR}/nccl-env-profile-ll128.sh
                     # Get all relevant NCCL / env vars to pass to all workers
-                    ENV_VARS=$(echo ${!NCCL*} ${!OMPI*} LD_LIBRARY_PATH PATH | sed 's/ / -x /g')
-
-                    mpirun --hostfile /tmp/hostfile \
-                      -x $ENV_VARS  \
-                      -mca plm_rsh_no_tree_spawn 1 \
-                      --mca orte_keep_fqdn_hostnames 1 \
-                      --mca btl self,tcp \
-                      --mca btl_tcp_if_include eth0 \
-                      --bind-to none \
-                      --mca plm_rsh_agent "ssh -q -o LogLevel=ERROR -o StrictHostKeyChecking=no -p 222" \
-                      /third_party/nccl-tests/build/all_gather_perf -b 1K -e 8G -f 2 -g 1 -w 5 --iters 100 -c 1
+                    export ENV_VARS=$(echo ${!NCCL*} ${!OMPI*} LD_LIBRARY_PATH PATH | sed 's/ / -x /g')
+                    export BENCHMARK=all_gather_perf
+                    DATA_MIN="${DATA_MIN:-8}"
+                    DATA_MAX="${DATA_MAX:-8G}"
+                    GPU_PER_NODE="${GPU_PER_NODE:-8}"
+                    RUN_ITERS="${RUN_ITERS:-20}"
+                    WARMUP_ITERS="${WARMUP_ITERS:-5}"
+                    #sleep infinity;
+                    mpirun --mca btl tcp,self --mca btl_tcp_if_include eth0 --allow-run-as-root \
+                    --mca orte_keep_fqdn_hostnames 1 \
+                    -np $(( GPU_PER_NODE * "${N_NODES}" )) \
+                    --hostfile /tmp/hostfile \
+                    -x NCCL_DEBUG_FILE="/tmp/${BENCHMARK}"-%h-%p.log \
+                    -x NCCL_TOPO_DUMP_FILE="/tmp/${BENCHMARK}"_topo.txt \
+                    -x NCCL_GRAPH_DUMP_FILE="/tmp/${BENCHMARK}"_graph.txt \
+                    -x LD_LIBRARY_PATH -x PATH \
+                    -x NCCL_DEBUG=INFO -x NCCL_DEBUG_SUBSYS=INIT,NET \
+                    -x NCCL_TESTS_SPLIT_MASK="${NCCL_TESTS_SPLIT_MASK:-0x0}" \
+                    -x NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY="${NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY}" \
+                    -x NCCL_LIB_DIR="${NCCL_LIB_DIR}" \
+                    --mca plm_rsh_agent "ssh -q -o LogLevel=ERROR -o StrictHostKeyChecking=no -p 222" \
+                    taskset -c 32-63 /tmp/demo_mpi_entry_with_config_profile.sh "${BENCHMARK}" \
+                    -b "${DATA_MIN}" -e "${DATA_MAX}" -f 2 -g 1 -w "${WARMUP_ITERS}" --iters "${RUN_ITERS}" 2>&1 | \
+                    tee "/tmp/${BENCHMARK}_nh${N_NODES}_ng${GPU_PER_NODE}_i${RUN_ITERS}.txt"
 
                 else
-                    while ping -c 1 ${WORKERS_BASENAME}-0.${POSTFIX}; do
-                    sleep 5
-                done
+                    until ssh -p 222 -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=1 ${hostname_prefix}-${hostname_suffix}-0-0.${hostname_prefix} true; do
+                      echo "Waiting for leader up ..."
+                      sleep 5
+                    done
+                    while ssh -p 222 -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=1 ${hostname_prefix}-${hostname_suffix}-0-0.${hostname_prefix} true; do
+                      echo "Leader is still up ..."
+                      sleep 5
+                    done
                 fi
 
                 exit 0
@@ -212,8 +226,6 @@ spec:
               volumeMounts:
               - name: nvidia
                 mountPath: /usr/local/nvidia
-              - name: gib
-                mountPath: /usr/local/gib
               - name: shared-memory
                 mountPath: /dev/shm
               resources:
@@ -221,3 +233,5 @@ spec:
                   nvidia.com/gpu: 8
                 requests:
                   nvidia.com/gpu: 8
+
+
