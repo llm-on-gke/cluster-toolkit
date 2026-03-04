@@ -32,9 +32,9 @@ spec:
         parallelism: 2
         completions: 2
         template:
-          metadata:
-             annotations:
-              kueue.x-k8s.io/podset-preferred-topology: "kubernetes.io/hostname"
+          #metadata:
+          #   annotations:
+          #    kueue.x-k8s.io/podset-preferred-topology: "kubernetes.io/hostname"
    
           spec:
             # Limit benchmark run duration
