@@ -42,11 +42,15 @@ spec:
             restartPolicy: Never
             nodeSelector:
                cloud.google.com/gke-nodepool: a3-megagpu-8g-a3megagpupool #for dws
+               cloud.google.com/gke-flex-start: "true"
                #cloud.google.com/gke-accelerator: nvidia-h100-mega-80gb 
             tolerations:
             - key: "nvidia.com/gpu"
               operator: "Exists"
               effect: "NoSchedule"
+            - key: cloud.google.com/gke-queued
+              effect: NoSchedule
+              value: "true"
             hostNetwork: true
             dnsPolicy: ClusterFirstWithHostNet
             #setHostnameAsFQDN: true
