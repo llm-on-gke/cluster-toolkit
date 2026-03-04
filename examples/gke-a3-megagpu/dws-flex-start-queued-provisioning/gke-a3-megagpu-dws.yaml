@@ -19,13 +19,13 @@ blueprint_name: gke-a3-mega
 terraform_backend_defaults:
   type: gcs
   configuration:
-    bucket: 
+    bucket: XXXX
 
 vars:
   project_id:  northam-ce-mlai-tpu ## Set GCP Project ID Here ##
-  deployment_name: rick-a3-mega-dws
-  region: asia-northeast1
-  zone: asia-northeast1-b
+  deployment_name: rick-a3-mega-dws #replace deployment name
+  region: us-central1
+  zone: us-central1-a
 
   # Cidr block containing the IP of the machine calling terraform.
   # The following line must be updated for this example to work.

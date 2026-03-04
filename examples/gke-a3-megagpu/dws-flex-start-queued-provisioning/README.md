@@ -66,7 +66,7 @@ Note: If you create multiple clusters using these same cluster blueprints, ensur
     ```sh
     cd ~/cluster-toolkit
     ./gcluster deploy  \
-    examples/gke-a3-megagpu/dws-flex-start-queued-provisioning/gke-a3-megagpu-dws.yaml \
+    examples/gke-a3-megagpu/dws-flex-start-queued-provisioning/gke-a3-megagpu-dws.yaml -w
     ```
 
 1. When prompted, select (A)pply to deploy the blueprint.
