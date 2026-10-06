@@ -19,19 +19,54 @@ locals {
   cluster_name     = local.cluster_id_parts[5]
   cluster_location = local.cluster_id_parts[3]
   project_id       = var.project_id != null ? var.project_id : local.cluster_id_parts[1]
-  kueue_config_content = join("\n---\n", compact([
-    try(var.kueue.enable_pathways_for_tpus, false) ? templatefile("${path.module}/kueue/pathways.yaml.tftpl", {
-      pathways_nodepool_name = "cpu-np"
-      pathways_cpu_quota     = 480
-      pathways_memory_quota  = "2000G"
-    }) : "",
-    var.kueue.config_path != null && var.kueue.config_path != "" ? (
-      endswith(var.kueue.config_path, ".tftpl") || length(try(var.kueue.config_template_vars, {})) > 0 ?
-      templatefile(var.kueue.config_path, try(var.kueue.config_template_vars, {})) :
-      file(var.kueue.config_path)
+  enable_pathways  = var.enable_pathways_for_tpus || var.kueue.enable_pathways_for_tpus
+  enable_slicing   = var.kueue.enable_dynamic_slicing_for_tpus
+
+  kueue_default_config_template = lookup({
+    "true-true"  = "${path.module}/kueue/kueue-configuration-dynamic-slicing-pathways.yaml.tftpl",
+    "false-true" = "${path.module}/kueue/kueue-configuration-dynamic-slicing.yaml.tftpl",
+    "true-false" = "${path.module}/kueue/kueue-configuration-pathways.yaml.tftpl",
+  }, "${local.enable_pathways}-${local.enable_slicing}", "")
+
+
+  kueue_config_template_vars = merge(
+    {
+      namespace               = "default"
+      pathways_cpu_quota      = 480
+      pathways_memory_quota   = "2000G"
+      tpu_flavor_cpu_quota    = "999999" # High default to avoid limiting TPU pods by CPU
+      tpu_flavor_memory_quota = "999999T"
+      tpu_quota               = "999999" # Default high value if not set
+      tpu_topology            = ""
+    },
+    var.kueue.config_template_vars != null ? var.kueue.config_template_vars : {}
+  )
+
+  kueue_default_config_content = local.kueue_default_config_template != "" ? (
+    endswith(local.kueue_default_config_template, ".tftpl") ?
+    templatefile(local.kueue_default_config_template, local.kueue_config_template_vars) :
+    file(local.kueue_default_config_template)
+  ) : ""
+
+  kueue_user_config_content = var.kueue.config_path != "" && var.kueue.config_path != null ? (
+    endswith(var.kueue.config_path, ".tftpl") || (var.kueue.config_template_vars != null && length(var.kueue.config_template_vars) > 0) ?
+    templatefile(var.kueue.config_path, local.kueue_config_template_vars) :
+    file(var.kueue.config_path)
+  ) : ""
+
+  kueue_config_content = local.kueue_user_config_content != "" ? local.kueue_user_config_content : local.kueue_default_config_content
+
+  configure_kueue       = local.install_kueue && local.kueue_config_content != ""
+  webhook_wait_duration = "60s"
+
+  asapd_lite_config_content = (
+    var.asapd_lite.config_path != null && var.asapd_lite.config_path != "" ?
+    (
+      endswith(var.asapd_lite.config_path, ".tftpl") || (var.asapd_lite.config_template_vars != null && length(var.asapd_lite.config_template_vars) > 0) ?
+      templatefile(var.asapd_lite.config_path, var.asapd_lite.config_template_vars != null ? var.asapd_lite.config_template_vars : {}) :
+      file(var.asapd_lite.config_path)
     ) : ""
-  ]))
-  configure_kueue = local.install_kueue && (try(var.kueue.config_path, "") != "" || try(var.kueue.enable_pathways_for_tpus, false))
+  )
 
   kueue_docs            = [for doc in split("\n---", local.kueue_config_content) : trimspace(doc) if length(trimspace(doc)) > 0]
   parsed_kueue_docs     = [for doc in local.kueue_docs : yamldecode(doc)]
@@ -42,9 +77,9 @@ locals {
     for name, cqs in local.merged_cluster_queues : {
       apiVersion = cqs[0].apiVersion
       kind       = cqs[0].kind
-      metadata   = cqs[0].metadata
+      metadata   = merge([for cq in cqs : cq.metadata if try(cq.metadata, null) != null]...)
       spec = merge(
-        try(cqs[0].spec, {}),
+        merge([for cq in cqs : cq.spec if try(cq.spec, null) != null]...),
         {
           resourceGroups = flatten([for cq in cqs : try(cq.spec.resourceGroups, [])])
         }
@@ -62,7 +97,7 @@ locals {
   # 2. Identify URL-based manifests
   url_manifests = {
     for index, manifest in local.enabled_manifests : index => manifest
-    if try(manifest.source, null) != null && (startswith(manifest.source, "http://") || startswith(manifest.source, "https://"))
+    if try(startswith(manifest.source, "http://") || startswith(manifest.source, "https://"), false)
   }
 
   # 3. Identify directory-based manifests
@@ -73,32 +108,47 @@ locals {
     (endswith(manifest.source, "/") || (!fileexists(manifest.source) && can(fileset(manifest.source, "*"))))
   }
 
+  # Pre-calculate normalized names for each manifest
+  manifest_names = {
+    for index, manifest in local.enabled_manifests : index =>
+    trim(replace(lower(
+      (try(coalesce(manifest.name, ""), "") != "" ? manifest.name :
+        "${substr((try(manifest.source, null) != null && manifest.source != "") ? replace(basename(manifest.source), "/(\\.(tftpl|yaml|yml))+$/", "") : "${var.module_id}-raw", 0, 30)}-${substr(sha1(join("|", [
+          try(manifest.source != null ? manifest.source : "", ""),
+          try(manifest.content != null ? manifest.content : "", ""),
+          join(",", try(keys(manifest.template_vars), []))
+        ])), 0, 7)}-${index}"
+      )
+    ), "/[^a-z0-9-]+/", "-"), "-")
+  }
+
   # 4. Rebuild the map by populating the 'content' field for all manifests
   processed_apply_manifests_map = tomap({
-    for index, manifest in local.enabled_manifests : tostring(index) => {
+    for index, manifest in local.enabled_manifests :
+    local.manifest_names[index] => {
       content = (
         # Step A: Use the fetched body if it's a URL
         contains(keys(local.url_manifests), tostring(index)) ? data.http.manifest_from_url[tostring(index)].body :
 
-        # Step B: Process directory files 
+        # Step B: Process directory files
         contains(keys(local.directory_manifests), index) ? (
           join("\n---\n", [
             # Use union() to combine the results of fileset (which are sets)
-            for f in union(
+            for f in setunion(
               fileset(manifest.source, "*.yaml"),
               fileset(manifest.source, "*.yml"),
               fileset(manifest.source, "*.tftpl")
               ) : (
               endswith(f, ".tftpl") ?
-              templatefile("${trimsuffix(manifest.source, "/")}/${f}", try(manifest.template_vars, {})) :
+              templatefile("${trimsuffix(manifest.source, "/")}/${f}", manifest.template_vars != null ? manifest.template_vars : {}) :
               file("${trimsuffix(manifest.source, "/")}/${f}")
             )
           ])
         ) :
         # Step C: Single file logic (implied if source is provided but not a URL or Dir)
         (manifest.source != null && manifest.source != "") ? (
-          endswith(manifest.source, ".tftpl") || length(try(manifest.template_vars, {})) > 0 ?
-          templatefile(manifest.source, try(manifest.template_vars, {})) :
+          endswith(manifest.source, ".tftpl") || (manifest.template_vars != null && length(manifest.template_vars) > 0) ?
+          templatefile(manifest.source, manifest.template_vars != null ? manifest.template_vars : {}) :
           file(manifest.source)
         )
         :
@@ -111,11 +161,19 @@ locals {
   })
 
   install_kueue             = try(var.kueue.install, false)
+  install_cert_manager      = try(var.cert_manager.install, false)
   install_jobset            = try(var.jobset.install, false)
   install_gpu_operator      = try(var.gpu_operator.install, false)
   install_nvidia_dra_driver = try(var.nvidia_dra_driver.install, false)
   install_gib               = try(var.gib.install, false)
   install_asapd_lite        = try(var.asapd_lite.install, false)
+
+  jobset_controller_cpu    = try(var.jobset.controller_cpu, null) != null ? var.jobset.controller_cpu : (local.enable_slicing ? "4" : null)
+  jobset_controller_memory = try(var.jobset.controller_memory, null) != null ? var.jobset.controller_memory : (local.enable_slicing ? "16Gi" : null)
+
+  kueue_controller_cpu      = try(var.kueue.controller_cpu, null) != null ? var.kueue.controller_cpu : (local.enable_slicing ? "16" : null)
+  kueue_controller_memory   = try(var.kueue.controller_memory, null) != null ? var.kueue.controller_memory : (local.enable_slicing ? "64Gi" : null)
+  kueue_controller_replicas = try(var.kueue.controller_replicas, null) != null ? var.kueue.controller_replicas : (local.enable_slicing ? 3 : null)
 }
 
 data "http" "manifest_from_url" {
@@ -131,20 +189,16 @@ data "google_container_cluster" "gke_cluster" {
 
 data "google_client_config" "default" {}
 
-resource "random_id" "release_suffix" {
-  byte_length = 4
-}
-
 module "kubectl_apply_manifests" {
   for_each   = local.processed_apply_manifests_map
   source     = "./helm_install"
   depends_on = [var.gke_cluster_exists]
 
-  release_name  = "manifest-apply-${random_id.release_suffix.hex}-${each.key}"
+  release_name  = "manifest-${each.key}"
   chart_name    = "${path.module}/raw-config-chart"
   chart_version = "0.1.0"
   namespace     = each.value.namespace
-  atomic        = true
+  atomic        = each.value.wait_for_rollout
   wait          = each.value.wait_for_rollout
   timeout       = 1200
   values_yaml = [
@@ -166,13 +220,40 @@ module "install_kueue" {
   chart_version    = var.kueue.version
   namespace        = "kueue-system"
   create_namespace = true
-  values_yaml = [
-    file("${path.module}/kueue/kueue-helm-values.yaml")
-  ]
+  values_yaml = compact([
+    file("${path.module}/kueue/kueue-helm-values.yaml"),
+    local.kueue_controller_cpu != null || local.kueue_controller_memory != null || local.kueue_controller_replicas != null ? yamlencode({
+      controllerManager = merge(
+        local.kueue_controller_replicas != null ? { replicas = local.kueue_controller_replicas } : {},
+        local.kueue_controller_cpu != null || local.kueue_controller_memory != null ? {
+          manager = {
+            resources = {
+              requests = merge(
+                local.kueue_controller_cpu != null ? { cpu = local.kueue_controller_cpu } : {},
+                local.kueue_controller_memory != null ? { memory = local.kueue_controller_memory } : {}
+              )
+              limits = merge(
+                local.kueue_controller_cpu != null ? { cpu = local.kueue_controller_cpu } : {},
+                local.kueue_controller_memory != null ? { memory = local.kueue_controller_memory } : {}
+              )
+            }
+          }
+        } : {}
+      )
+    }) : ""
+  ])
 
   dependencies = var.system_node_pool_id != null ? [var.system_node_pool_id] : []
 
   depends_on = [var.gke_cluster_exists]
+}
+
+# This sleep ensures that subsequent configuration of Kueue custom resources
+# do not fail due to the webhook not being available.
+resource "time_sleep" "wait_for_webhook" {
+  count           = local.install_kueue ? 1 : 0
+  create_duration = local.webhook_wait_duration
+  depends_on      = [module.install_kueue]
 }
 
 module "configure_kueue" {
@@ -183,7 +264,7 @@ module "configure_kueue" {
   chart_version    = "0.1.0"
   namespace        = "kueue-system"
   create_namespace = true
-  wait             = false # Configuration resources (Queues) usually don't need wait
+  wait             = true
 
   values_yaml = [
     yamlencode({
@@ -191,7 +272,7 @@ module "configure_kueue" {
     })
   ]
 
-  depends_on = [module.install_kueue]
+  depends_on = [time_sleep.wait_for_webhook]
 
 }
 
@@ -206,10 +287,39 @@ module "install_jobset" {
   chart_version    = var.jobset.version
   namespace        = "jobset-system"
   create_namespace = true
-  values_yaml = [
-    file("${path.module}/jobset/jobset-helm-values.yaml")
-  ]
+  values_yaml = compact([
+    file("${path.module}/jobset/jobset-helm-values.yaml"),
+    local.jobset_controller_cpu != null || local.jobset_controller_memory != null ? yamlencode({
+      controller = {
+        resources = {
+          requests = merge(
+            local.jobset_controller_cpu != null ? { cpu = local.jobset_controller_cpu } : {},
+            local.jobset_controller_memory != null ? { memory = local.jobset_controller_memory } : {}
+          )
+          limits = merge(
+            local.jobset_controller_cpu != null ? { cpu = local.jobset_controller_cpu } : {},
+            local.jobset_controller_memory != null ? { memory = local.jobset_controller_memory } : {}
+          )
+        }
+      }
+    }) : ""
+  ])
   depends_on = [var.gke_cluster_exists, module.configure_kueue]
+}
+
+module "install_cert_manager" {
+  source           = "./helm_install"
+  count            = local.install_cert_manager ? 1 : 0
+  wait_for_jobs    = true
+  timeout          = 1200
+  release_name     = "cert-manager"
+  chart_repository = "https://charts.jetstack.io"
+  chart_name       = "cert-manager"
+  chart_version    = var.cert_manager.version
+  namespace        = "cert-manager"
+  create_namespace = true
+  set_values       = [{ name = "installCRDs", value = "true", type = "auto" }]
+  depends_on       = [var.gke_cluster_exists, module.configure_kueue, module.install_jobset]
 }
 
 module "install_nvidia_dra_driver" {
@@ -357,12 +467,56 @@ module "install_gib" {
 }
 
 module "install_asapd_lite" {
-  source            = "./kubectl"
-  source_path       = local.install_asapd_lite ? var.asapd_lite.config_path : null
-  server_side_apply = true
-  wait_for_rollout  = true
+  source        = "./helm_install"
+  count         = local.install_asapd_lite ? 1 : 0
+  release_name  = "asapd-lite"
+  chart_name    = "${path.module}/raw-config-chart"
+  chart_version = "0.1.0"
+  namespace     = "kube-system"
+  wait          = true
+  depends_on    = [var.gke_cluster_exists]
 
-  providers = {
-    kubectl = kubectl
+  values_yaml = [
+    yamlencode({
+      manifests = length(trimspace(local.asapd_lite_config_content)) > 0 ? [local.asapd_lite_config_content] : []
+    })
+  ]
+}
+
+resource "kubernetes_annotations" "sa_patch" {
+  for_each    = var.service_account_annotations
+  depends_on  = [var.gke_cluster_exists]
+  api_version = "v1"
+  kind        = "ServiceAccount"
+
+  metadata {
+    name      = each.key
+    namespace = each.value.namespace
   }
+
+  annotations = {
+    "iam.gke.io/gcp-service-account" = each.value.gcp_service_account_email
+  }
+}
+
+module "install_slice_controller" {
+  source        = "./helm_install"
+  count         = local.enable_slicing ? 1 : 0
+  release_name  = "slice-controller"
+  chart_name    = "${path.module}/raw-config-chart"
+  chart_version = "0.1.0"
+  wait          = true
+
+  values_yaml = [
+    yamlencode({
+      manifests = [templatefile("${path.module}/kueue/slice-controller.yaml.tftpl", {
+        cpu_request    = var.kueue.slice_controller_cpu_request
+        memory_request = var.kueue.slice_controller_memory_request
+        cpu_limit      = var.kueue.slice_controller_cpu_limit
+        memory_limit   = var.kueue.slice_controller_memory_limit
+      })]
+    })
+  ]
+
+  depends_on = [var.gke_cluster_exists, module.configure_kueue, module.install_jobset]
 }

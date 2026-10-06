@@ -17,9 +17,10 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 
-SCRIPTS_DIR = "community/modules/scheduler/schedmd-slurm-gcp-v6-controller/modules/slurm_files/scripts"
-if SCRIPTS_DIR not in sys.path:
-    sys.path.append(SCRIPTS_DIR)  # TODO: make this more robust
+from pathlib import Path
+PARENT_DIR = str(Path(__file__).resolve().parent.parent)
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
 
 import util
 
@@ -38,12 +39,20 @@ class TstNodeset:
     node_count_dynamic_max: int = 0
     node_conf: dict[str, Any] = field(default_factory=dict)
     instance_template: Optional[str] = None
+    mig_name: Optional[str] = None
+    provisioning_engine: Optional[str] = None
     reservation_name: Optional[str] = ""
     zone_policy_allow: Optional[list[str]] = field(default_factory=list)
     enable_placement: bool = True
     placement_max_distance: Optional[int] = None
     accelerator_topology: Optional[str] = ""
+    slice_size: Optional[int] = None
+    gpu_count: Optional[int] = None
+    gpu: Optional[Any] = None
     future_reservation: Optional[str] = ""
+    subnetwork: str = "projects/p/regions/us-central1/subnetworks/default"
+    region: Optional[str] = None
+    dws_flex: Optional[Any] = None
 
 @dataclass
 class TstPartition:
@@ -55,7 +64,14 @@ class TstPartition:
 @dataclass
 class TstCfg:
     slurm_cluster_name: str = "m22"
+    project: str = "p"
+    provisioning_engine: str = "BULK_INSERT"
     cloud_parameters: dict[str, Any] = field(default_factory=dict)
+    experimental: dict[str, Any] = field(default_factory=dict)
+    enable_health_check_start_only: bool = False
+    enable_expedited_requeue: bool = False
+    enable_openmetrics: bool = False
+    google_app_cred_path: Optional[str] = None
 
     partitions: dict[str, TstPartition] = field(default_factory=dict)
     nodeset: dict[str, TstNodeset] = field(default_factory=dict)
@@ -64,6 +80,22 @@ class TstCfg:
     
     install_dir: Optional[str] = None
     output_dir: Optional[str] = None
+    slurm_bin_dir: Optional[str] = "/usr/bin"
+
+    enable_controller_load_balancer: bool = False
+    slurm_control_host: Optional[str] = None
+    slurm_control_addr: Optional[str] = None
+    slurm_conf_tpl: Optional[str] = None
+    ompi_version: Optional[str] = None
+    controller_network_attachment: bool = False
+    enable_slurm_auth: bool = False
+    accounting_storage_backup_host: Optional[str] = None
+    slurm_backup_controller_name: Optional[str] = None
+    slurm_backup_controller_ip: Optional[str] = None
+    slurm_control_host_port: Optional[str] = None
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
     prolog_scripts: Optional[list[Placeholder]] = field(default_factory=list)
     epilog_scripts: Optional[list[Placeholder]] = field(default_factory=list)

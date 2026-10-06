@@ -68,17 +68,14 @@ This section guides you through the cluster creation process, ensuring that your
    * `num_slices`: the number of TPU slices to create.
    * `machine_type`: the machine type of the TPU.
    * `tpu_topology`: the TPU placement topology for pod slice node pool.
-   * `static_node_count`: the number of TPU nodes in your cluster.
    * `authorized_cidr`: The IP address range that you want to allow to connect with the cluster. This CIDR block must include the IP address of the machine to call Terraform.
-   * `reservation`: the name of the compute engine reservation of TPU v6e nodes.
+   * `reservation_affinity`: the reservation settings (by default, specify the reservation name under Option 1, or uncomment an alternative consumption model such as DWS Flex Start, DWS Flex Start + Queued Provisioning, Spot, or On-Demand).
+
+    > **Note:** The `static_node_count` is now automatically calculated from `machine_type`, `num_slices` and `tpu_topology`. It is derived using the formula: `(total_chips_in_topology / chips_per_machine)`.
 
     To modify advanced settings, edit `examples/gke-tpu-v6e/gke-tpu-v6e.yaml`.
 
-1. To use on-demand capacity, you can remove the reservation usage by making the following changes.
-   1. Remove the `reservation` variable from the [`gke-tpu-v6e-deployment.yaml`](https://github.com/GoogleCloudPlatform/cluster-toolkit/blob/main/examples/gke-tpu-v6e/gke-tpu-v6e-deployment.yaml) file.
-   1. Remove the `reservation_affinity` block from the nodepool module.
-
-1. To utilize spot instances, remove the reservation variable from gke-tpu-v6e-deployment.yaml and add spot: true. In gke-tpu-v6e.yaml, replace the reservation_affinity block under gke-tpu-v6e-pool module with spot: $(vars.spot)
+    > **Note:** Queued provisioning (Option 3) is only supported on multi-host TPU slices. For more information, see [About flex-start provisioning mode](https://cloud.google.com/kubernetes-engine/docs/concepts/dws).
 
 1. Generate [Application Default Credentials (ADC)](https://cloud.google.com/docs/authentication/provide-credentials-adc#google-idp) to provide access to Terraform.
 
@@ -123,8 +120,16 @@ The process is nearly identical to the basic deployment.
 
 This blueprint supports [Kueue](https://kueue.sigs.k8s.io/), a kubernetes-native system for managing quotas and job queuing. This is enabled by default in the advanced blueprint (`gke-tpu-v6e-advanced.yaml`).
 
-1. **Quota:** The blueprint automatically calculates and sets a `google.com/tpu` quota in the `ClusterQueue` matching the total static TPU capacity of your cluster (slices x nodes x chips).
-2. **Submit a Job:** To submit a job to the queue, add the label `kueue.x-k8s.io/queue-name: user-queue` to your Job or JobSet manifest.
+**NOTE**:
+By default, the toolkit dynamically applies an embedded kueue configuration based on your **Pathways** and **Dynamic Slicing** settings.
+
+1. **Custom Configurations:**
+   * If you explicitly disable both Pathways and Dynamic Slicing, the toolkit will still install the Kueue engine/controllers, but it leaves them unconfigured(no default queues or resource flavors are created).
+   * If you want to override the default embedded configurations, or apply configuration in the scenario above, you can uncomment and set `config_path` in the `kueue` section of the `workload-manager-install` module in the blueprint.
+   * For more details on default configurations and variables, see the [`kubectl-apply` documentation](https://github.com/GoogleCloudPlatform/cluster-toolkit/tree/main/modules/management/kubectl-apply#inputs).
+
+2. **Quota:** The blueprint automatically calculates and sets a `google.com/tpu` quota in the `ClusterQueue`. The node count is automatically derived from your `machine_type` and `tpu_topology`, and the quota is calculated as: `num_slices` × `(total_chips_in_topology / chips_per_machine)` × `chips_per_machine`.
+3. **Submit a Job:** To submit a job to the queue, add the label `kueue.x-k8s.io/queue-name: user-queue` to your Job or JobSet manifest.
 
     A sample job file is provided: `kueue-job-sample.yaml`.
 
@@ -132,7 +137,7 @@ This blueprint supports [Kueue](https://kueue.sigs.k8s.io/), a kubernetes-native
     kubectl create -f ~/cluster-toolkit/examples/gke-tpu-v6e/kueue-job-sample.yaml
     ```
 
-3. **Validation:** Check the status of your workload.
+4. **Validation:** Check the status of your workload.
 
     ```sh
     kubectl get workloads
@@ -188,6 +193,16 @@ The [tpu-multislice.yaml](https://github.com/GoogleCloudPlatform/cluster-toolkit
 
     This should display `Global device count: 32` at the end of the logs which is the number of TPU chips across all of the nodes in a multi-host TPU slice.
 
+## Configuring ML Diagnostics
+
+This blueprint supports [Google Cloud ML Diagnostics](https://docs.cloud.google.com/tpu/docs/ml-diagnostics/overview) (also known as Diagon++). This managed service simplifies the observability of AI/ML workloads on GKE by providing integrated profiling, automated log analysis, and topology-aware monitoring directly within the Google Cloud Console.
+
+This feature is enabled by default and requires GKE version 1.35.0-gke.3065000 or higher. It can be configured using the `enable_ml_diagnostics` setting in the `gke-tpu-v6e-cluster` module. When enabled, the cluster is automatically configured with the necessary ML Diagnostics components, the designated user namespace is labeled, and the Workload Identity service accounts required by the ML Diagnostics SDK are provisioned.
+
+To leverage ML Diagnostics in your own workloads, you need to integrate the ML Diagnostics SDK within your job scripts. For detailed instructions on SDK integration and viewing your profiling data, please refer to the [Google Cloud ML Diagnostics documentation](https://docs.cloud.google.com/tpu/docs/ml-diagnostics/sdk).
+
+To test ML Diagnostics with a sample workload, refer to the [ML Diagnostics Sample Workload Test README](./ml-diagnostics-sample-workload-test/README.md). This guide explains how to build a test image and run a job to verify metrics and profiling in the Google Cloud Console.
+
 ## Clean up
 
 To avoid recurring charges for the resources used on this page, clean up the resources provisioned by Cluster Toolkit, including the VPC networks and GKE cluster:
@@ -195,6 +210,8 @@ To avoid recurring charges for the resources used on this page, clean up the res
    ```sh
    ./gcluster destroy gke-tpu-v6e/
    ```
+
+**Note:** GCS buckets created for Terraform state are not deleted by the `./gcluster destroy` command and must be deleted manually.
 
 ## Appendix
 

@@ -21,31 +21,134 @@ tags:
 substitutions:
   _TEST_PREFIX: "" # Default to no prefix
 
-timeout: 3600s  # 1hr
+timeout: 86400s
+queueTtl: 86400s  # 24hr
+logsBucket: "gs://$PROJECT_NUMBER.cloudbuild-logs.googleusercontent.com"
+
 steps:
-# While using static network names we are guarding against more than 1 instance running at a time (for multi-group tests)
-- id: check_for_running_build
+# 1. Build and push workspace container containing the current code layer
+- id: build-workspace-image
+  name: gcr.io/cloud-builders/docker
+  entrypoint: /bin/bash
+  env:
+  - 'PROJECT_ID=$PROJECT_ID'
+  - 'BUILD_ID=$BUILD_ID'
+  args:
+  - tools/cloud-build/image_build_push.sh
+
+# 2. Generate Job Manifest
+- id: generate-job-manifest
   name: gcr.io/cloud-builders/gcloud
-  script: "tools/cloud-build/check_running_build.sh tools/cloud-build/daily-tests/builds/e2e.yaml"
+  entrypoint: /bin/bash
+  args:
+  - -c
+  - |
+    set -eo pipefail
+    BUILD_ID_SHORT=$$(echo "$BUILD_ID" | cut -c1-6)
 
-- name: us-central1-docker.pkg.dev/$PROJECT_ID/hpc-toolkit-repo/test-runner
-  automapSubstitutions: true
-  script: |
-    #!/usr/bin/env bash
-    set -ex
+    if [ "${_TEST_PREFIX}" == "hotfix-" ]; then
+      PRIORITY_LINE="priorityClassName: emergency-hotfix-priority"
+    else
+      PRIORITY_LINE=""
+    fi
 
-    depl_name="e2e-${BUILD_ID:0:6}"
-    region="us-central1"
-    zone="us-central1-a"
-    vars="project_id=$PROJECT_ID,deployment_name=$depl_name,region=$region,zone=$zone"
+    cat <<EOF > job.yaml
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: e2e-$$BUILD_ID_SHORT
+      namespace: default
+      labels:
+        kueue.x-k8s.io/queue-name: local-queue-test-locks
+        build-id: "$BUILD_ID"
+    spec:
+      suspend: true
+      backoffLimit: 0
+      template:
+        metadata:
+          annotations:
+            cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+        spec:
+          $$PRIORITY_LINE
+          terminationGracePeriodSeconds: 1800
+          serviceAccountName: test-kueue-cluster-runner-ksa
+          restartPolicy: Never
+          containers:
+          - name: runner
+            image: us-central1-docker.pkg.dev/$PROJECT_ID/hpc-toolkit-repo/test-runner:$BUILD_ID
+            env:
+            - name: BUILD_ID
+              value: "$BUILD_ID"
+            - name: PROJECT_ID
+              value: "$PROJECT_ID"
+            - name: _TEST_PREFIX
+              value: "${_TEST_PREFIX}"
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              set -x -e
+              echo "\"test_file_path\": tools/cloud-build/daily-tests/builds/e2e.yaml"
+              cd /workspace
 
-    cd /workspace
-    make
-    BLUEPRINT="tools/cloud-build/daily-tests/blueprints/e2e.yaml"
-    bash tools/add_ttl_label.sh "${BLUEPRINT}"
-    ./gcluster deploy "${BLUEPRINT}" --vars="$vars" --auto-approve
+              DEPLOYMENT_NAME="e2e-$$BUILD_ID_SHORT"
 
-    # check instance was created
-    gcloud compute instances describe "${depl_name}-0" --project="$PROJECT_ID" --zone="$zone" >/dev/null
+              # Force clear any leaked Terraform state locks from previously preempted attempts of this test run.
+              echo "Checking for and clearing leaked Terraform state locks..."
+              gcloud storage rm -r "gs://daily-tests-tf-state/*/\$$DEPLOYMENT_NAME/**.tflock" 2>/dev/null || true
 
-    ./gcluster destroy "$depl_name" --auto-approve --robust
+              RUN_CLEANUP=true
+              source /workspace/tools/cloud-build/kueue_cleanup_pod.sh
+              trap cleanup_pod EXIT SIGTERM SIGINT
+
+              region="us-central1"
+              zone="us-central1-a"
+              vars="project_id=\$$PROJECT_ID,deployment_name=\$$DEPLOYMENT_NAME,region=\$$region,zone=\$$zone"
+
+              bash tools/get_binary.sh "" "true"
+              BLUEPRINT="tools/cloud-build/daily-tests/blueprints/e2e.yaml"
+              bash tools/add_ttl_label.sh "\$$BLUEPRINT"
+
+              ./gcluster deploy "\$$BLUEPRINT" --vars="\$$vars" --auto-approve &
+              ANSIBLE_PID=\$$!
+              wait \$$ANSIBLE_PID
+
+              # check instance was created
+              gcloud compute instances describe "\$${DEPLOYMENT_NAME}-0" --project="\$$PROJECT_ID" --zone="\$$zone" >/dev/null &
+              ANSIBLE_PID=\$$!
+              wait \$$ANSIBLE_PID
+
+              ./gcluster destroy "\$$DEPLOYMENT_NAME" --auto-approve --robust &
+              ANSIBLE_PID=\$$!
+              wait \$$ANSIBLE_PID
+
+              RUN_CLEANUP=false
+            resources:
+              requests:
+                cpu: 200m
+                memory: "2Gi"
+                test-locks/e2e: 1
+              limits:
+                cpu: 1
+                memory: "2Gi"
+                test-locks/e2e: 1
+    EOF
+
+# 3. Submit and Monitor GKE Kueue Job with Retry
+- id: submit-and-monitor-gke-job
+  name: gcr.io/cloud-builders/gcloud
+  entrypoint: /bin/bash
+  args:
+  - tools/cloud-build/submit_and_monitor_kueue_job.sh
+  - e2e
+  - $BUILD_ID
+
+# 4. Cleanup the built image from Registry to save costs
+- id: cleanup-image
+  name: gcr.io/cloud-builders/gcloud
+  entrypoint: /bin/bash
+  allowFailure: true
+  env:
+  - 'PROJECT_ID=$PROJECT_ID'
+  - 'BUILD_ID=$BUILD_ID'
+  args:
+  - tools/cloud-build/image_cleanup.sh

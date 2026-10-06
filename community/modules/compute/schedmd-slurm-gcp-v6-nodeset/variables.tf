@@ -88,7 +88,7 @@ variable "instance_image" {
     EOD
   type        = map(string)
   default = {
-    family  = "slurm-gcp-6-12-hpc-rocky-linux-8"
+    family  = "slurm-gcp-6-12-hpc-rocky-linux-9"
     project = "schedmd-slurm-public"
   }
 
@@ -142,6 +142,12 @@ variable "disk_type" {
   default     = "pd-standard"
 }
 
+variable "disk_storage_pool" {
+  description = "Storage pool to use for the boot disk. Note that storage pools are only supported with Hyperdisk types. For boot disks, only hyperdisk-balanced is supported. You must provide an existing storage pool, as this module does not create new ones."
+  type        = string
+  default     = null
+}
+
 variable "disk_size_gb" {
   description = "Size of boot disk to create for the partition compute nodes."
   type        = number
@@ -192,6 +198,7 @@ variable "additional_disks" {
     device_name                         = optional(string)
     disk_size_gb                        = optional(number)
     disk_type                           = optional(string)
+    disk_storage_pool                   = optional(string)
     disk_labels                         = optional(map(string))
     auto_delete                         = optional(bool)
     boot                                = optional(bool)
@@ -336,7 +343,7 @@ variable "guest_accelerator" {
 
 variable "accelerator_topology" {
   type        = string
-  description = "Specifies the shape of the Accelerator (GPU/TPU) slice."
+  description = "Specifies the shape of the Accelerator (GPU/TPU) slice. Note: When set, 'enable_placement' must be set to true (and 'node_count_dynamic_max' must be explicitly set to 0 when using 'provisioning_engine = MIG'). Warning: on a deployed nodeset using 'provisioning_engine = MIG', ANY change to this value - including changing one topology for another, and removing it - forces replacement of the managed instance group and destroys its running VMs. Drain the nodeset before changing it."
   nullable    = true
   default     = null
 }
@@ -488,12 +495,13 @@ variable "subnetwork_self_link" {
 }
 
 variable "additional_networks" {
-  description = "Additional network interface details for GCE, if any."
+  description = "Additional network interface details for GCE, if any. For Private Service Connect interfaces, 'network_attachment' must be the full resource URI: projects/{project}/regions/{region}/networkAttachments/{name}."
   default     = []
   type = list(object({
     network            = optional(string)
-    subnetwork         = string
+    subnetwork         = optional(string)
     subnetwork_project = optional(string)
+    network_attachment = optional(string)
     network_ip         = optional(string, "")
     nic_type           = optional(string)
     stack_type         = optional(string)
@@ -510,6 +518,32 @@ variable "additional_networks" {
       subnetwork_range_name = string
     })), [])
   }))
+  validation {
+    condition = alltrue([
+      for nic in var.additional_networks : (
+        # Cannot specify network or subnetwork alongside network_attachment
+        !(((nic.network != null && nic.network != "") || (nic.subnetwork != null && nic.subnetwork != "")) && (nic.network_attachment != null && nic.network_attachment != "")) &&
+        # Cannot specify subnetwork_project, access_config, ipv6_access_config, or alias_ip_range alongside network_attachment
+        (nic.network_attachment == null || nic.network_attachment == "" || (
+          (nic.subnetwork_project == null || nic.subnetwork_project == "") &&
+          length(try(nic.access_config, [])) == 0 &&
+          length(try(nic.ipv6_access_config, [])) == 0 &&
+          length(try(nic.alias_ip_range, [])) == 0
+        )) &&
+        # Must specify at least one of network, subnetwork, or network_attachment
+        ((nic.network != null && nic.network != "") || (nic.subnetwork != null && nic.subnetwork != "") || (nic.network_attachment != null && nic.network_attachment != ""))
+      )
+    ])
+    error_message = "In var.additional_networks, you must specify at least one of 'network', 'subnetwork', or 'network_attachment'. When 'network_attachment' is set, you cannot specify 'network', 'subnetwork', 'subnetwork_project', 'access_config', 'ipv6_access_config', or 'alias_ip_range'."
+  }
+  validation {
+    condition = alltrue([
+      for nic in var.additional_networks : (
+        nic.network_attachment == null || nic.network_attachment == "" || can(regex("^(?:https://www.googleapis.com/compute/[^/]+/)?projects/[^/]+/regions/[^/]+/networkAttachments/[^/]+$", nic.network_attachment))
+      )
+    ])
+    error_message = "In var.additional_networks, 'network_attachment' must be the full resource URI: projects/{project}/regions/{region}/networkAttachments/{name}."
+  }
 }
 
 variable "access_config" {
@@ -528,14 +562,15 @@ variable "reservation_name" {
 
     Formats:
     - Local Reservation: For reservations in the same project as the cluster (var.project_id), the name is sufficient:
-      RESERVATION_NAME[/reservationBlocks/BLOCK_ID]
+      RESERVATION_NAME[/reservationBlocks/BLOCK_ID[/reservationSubBlocks/SUBBLOCK_ID]]
     - Shared Reservation: For reservations shared from a different project, the full resource path is required:
-      projects/HOST_PROJECT_ID/reservations/RESERVATION_NAME[/reservationBlocks/BLOCK_ID]
+      projects/HOST_PROJECT_ID/reservations/RESERVATION_NAME[/reservationBlocks/BLOCK_ID[/reservationSubBlocks/SUBBLOCK_ID]]
 
     Where:
     - HOST_PROJECT_ID: Project ID where the shared reservation was created.
     - RESERVATION_NAME: The name assigned to the specific reservation.
     - BLOCK_ID (Optional): The identifier for a specific reservation block, if the reservation is composed of multiple blocks.
+    - SUBBLOCK_ID (Optional): The identifier for a specific reservation subblock within a block.
 
     Note: Using a shared reservation ideally requires the 'compute.reservations.get' permission for the node service account in the host project; without it, full details cannot be fetched, but deployment will still proceed with defaults.
   EOD
@@ -544,8 +579,8 @@ variable "reservation_name" {
   nullable    = false
 
   validation {
-    condition     = length(regexall("^((projects/([a-z0-9-]+)/reservations/)?([a-z0-9-]+)(/reservationBlocks/[a-z0-9-]+)?)?$", var.reservation_name)) > 0
-    error_message = "Reservation name must be either empty or in the format '[projects/PROJECT_ID/reservations/]RESERVATION_NAME[/reservationBlocks/BLOCK_ID]', [...] are optional parts."
+    condition     = length(regexall("^((projects/([a-z0-9-]+)/reservations/)?([a-z0-9-]+)(/reservationBlocks/[a-z0-9-]+(/reservationSubBlocks/[a-z0-9-]+)?)?)?$", var.reservation_name)) > 0
+    error_message = "Reservation name must be either empty or in the format '[projects/PROJECT_ID/reservations/]RESERVATION_NAME[/reservationBlocks/BLOCK_ID[/reservationSubBlocks/SUBBLOCK_ID]]', [...] are optional parts."
   }
 }
 
@@ -582,11 +617,13 @@ variable "startup_script" {
 variable "network_storage" {
   description = "An array of network attached storage mounts to be configured on nodes."
   type = list(object({
-    server_ip     = string,
-    remote_mount  = string,
-    local_mount   = string,
-    fs_type       = string,
-    mount_options = string,
+    server_ip               = string,
+    remote_mount            = string,
+    local_mount             = string,
+    local_mount_owner       = optional(string)
+    local_mount_permissions = optional(string)
+    fs_type                 = string,
+    mount_options           = string,
   }))
   default = []
 }
@@ -630,8 +667,8 @@ variable "dws_flex" {
   - use_bulk_insert: Uses the legacy implementation of DWS Flex Start with Bulk Insert for non-accelerator instances
 
  Limitations:
-  - CAN NOT be used with reservations;
-  - CAN NOT be used with placement groups;
+  - CAN NOT be used with reservations.
+
 
  EOD
 
@@ -666,4 +703,20 @@ variable "confidential_instance_type" {
   type        = string
   description = "The type of Confidential Computing to use (e.g., SEV, TDX). Required for some machine types like A3."
   default     = null
+}
+
+variable "machine_configs" {
+  description = "Definition of GCE machine types and counts"
+  type        = any
+  default     = {}
+}
+
+variable "provisioning_engine" {
+  description = "Compute node provisioning engine: 'AUTO', 'MIG', or 'BULK_INSERT'. Note: When using 'MIG', 'node_count_dynamic_max' must be explicitly set to 0, and 'enable_placement' is only supported when 'accelerator_topology' is specified. (Note: DWS Flex NodeSets should leave 'provisioning_engine' as 'AUTO')."
+  type        = string
+  default     = "AUTO"
+  validation {
+    condition     = contains(["AUTO", "MIG", "BULK_INSERT"], var.provisioning_engine)
+    error_message = "Variable 'provisioning_engine' must be 'AUTO', 'MIG', or 'BULK_INSERT'."
+  }
 }

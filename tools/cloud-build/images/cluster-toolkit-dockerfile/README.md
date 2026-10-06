@@ -14,7 +14,7 @@ To build and use this Dockerfile, you'll need:
 The following build arguments can be used to customize the build process:
 * **`BASE_IMAGE`**: The base image to use for the build. Defaults to `gcr.io/google.com/cloudsdktool/google-cloud-cli:stable`.
 * **`TERRAFORM_VERSION`**: The version of Terraform to install. Defaults to `1.12.2`.
-* **`PACKER_VERSION`**: The version of Packer to install. Defaults to `1.8.6`.
+* **`PACKER_VERSION`**: The version of Packer to install. Defaults to `1.15.3`.
 * **`GO_VERSION`**: The version of Go to install. Defaults to `1.23.0`.
 * **`CLUSTER_TOOLKIT_REF`**: The [Cluster Toolkit repository's](https://github.com/GoogleCloudPlatform/cluster-toolkit/releases) branch or tag from which to build Cluster Toolkit.  Defaults to the `main` branch, which is the latest official release.
 
@@ -33,10 +33,10 @@ docker build --build-arg BASE_IMAGE=<base_image> \
 Example:
 
 ```bash
-docker build --build-arg CLUSTER_TOOLKIT_REF=v1.40.0 -t gcluster -t ghpc .
+docker build --build-arg CLUSTER_TOOLKIT_REF=v1.103.0 -t gcluster -t ghpc .
 ```
 
-The above example builds an image tagged `gcluster` and sets the `CLUSTER_TOOLKIT_REF` to the Git tag `v1.40.0` while using the default values for other arguments.
+The above example builds an image tagged `gcluster` and sets the `CLUSTER_TOOLKIT_REF` to the Git tag `v1.103.0` (ensuring `>= v1.103.0` for security compliance with [Cluster Toolkit Security Bulletins](https://docs.cloud.google.com/cluster-toolkit/docs/security-bulletins)) while using the default values for other arguments.
 
 ## Run the Cluster Toolkit Docker Image
 To run the Cluster Toolkit Docker image, use the following command:

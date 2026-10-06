@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
+from typing import List, Optional, Union
 
 import os
 import sys
@@ -27,7 +27,7 @@ import uuid
 import shutil
 from pathlib import Path
 from concurrent.futures import as_completed
-from addict import Dict as NSDict # type: ignore
+from util import NSDict
 
 import util
 from util import NSMount, lookup, run, dirs, separate
@@ -99,12 +99,30 @@ def resolve_network_storage() -> List[NSMount]:
 
     return list(mounts.values())
 
-
 def is_controller_mount(mount) -> bool:
+    if not mount:
+        return False
+    if getattr(mount, "fs_type", None) == "gcsfuse":
+        return False
+    if not getattr(mount, "server_ip", None):
+        return lookup().is_controller
     # NOTE: Valid Lustre server_ip can take the form of '<IP>@tcp'
-    server_ip = mount.server_ip.split("@")[0]
-    mount_addr = util.host_lookup(server_ip)
-    return mount_addr == lookup().control_host_addr
+    server_ip = str(mount.server_ip).split("@")[0]
+    try:
+        mount_addr = util.host_lookup(server_ip) if server_ip else None
+    except Exception:
+        mount_addr = None
+    control_host = lookup().control_host
+    control_host_addr = lookup().control_host_addr
+    return (
+        (mount_addr is not None and mount_addr == control_host_addr)
+        or (control_host is not None and server_ip == control_host)
+        or (lookup().is_controller and (
+            server_ip in ("127.0.0.1", "localhost")
+            or server_ip == lookup().hostname
+            or mount_addr in ("127.0.0.1", "localhost")
+        ))
+    )
 
 def setup_network_storage():
     """prepare network fs mounts and add them to fstab"""
@@ -154,7 +172,7 @@ def setup_network_storage():
 
 def mount_fstab(mounts: list[NSMount], log):
     """Wait on each mount, then make sure all fstab is mounted"""
-    def mount_path(path: Path):
+    def mount_path(path: Path, mount_owner: Optional[str], mount_perm: Optional[str]):
         log.info(f"Waiting for '{path}' to be mounted...")
         try:
             run(f"mount {path}", timeout=120)
@@ -163,6 +181,29 @@ def mount_fstab(mounts: list[NSMount], log):
             log.error(f"mount of path '{path}' failed: {exc_type}: {e}")
             raise e
         log.info(f"Mount point '{path}' was mounted.")
+        if mount_owner and ":" in mount_owner:
+            user, group = mount_owner.split(":", 1)
+            uid: Union[int, str]
+            try:
+                uid = int(user)
+            except ValueError:
+                uid = user
+            gid: Union[int, str]
+            try:
+                gid = int(group)
+            except ValueError:
+                gid = group
+            try:
+                shutil.chown(path, user=uid, group=gid)
+                log.info(f"Mount point '{path}' changed owner to {user}:{group}.")
+            except LookupError as e:
+                log.error(f"Failed to resolve owner {user}:{group}: {e}")
+                raise e
+
+        if mount_perm:
+            mount_perm_int = int(mount_perm, 8)
+            os.chmod(path, mount_perm_int)
+            log.info(f"Mount point '{path}' changed mode to {mount_perm}.")
 
     MAX_MOUNT_TIMEOUT = 60 * 5
     future_list = []
@@ -173,7 +214,7 @@ def mount_fstab(mounts: list[NSMount], log):
         retry_policy=retry_policy
     ) as exe:
         for m in mounts:
-            future = exe.submit(mount_path, m.local_mount)
+            future = exe.submit(mount_path, m.local_mount, m.local_mount_owner, m.local_mount_permissions)
             future_list.append(future)
 
         # Iterate over futures, checking for exceptions
@@ -182,6 +223,26 @@ def mount_fstab(mounts: list[NSMount], log):
                 future.result()
             except Exception as e:
                 raise e
+
+
+def wait_for_file(file_path: Path, timeout: int = 300):
+    """Wait for a file to exist and be non-empty at the given path."""
+    log.info(f"Waiting up to {timeout}s for file to exist and be ready: {file_path}")
+
+    for retry, wait in enumerate(util.backoff_delay(1.0, timeout), 1):
+        try:
+            if file_path.exists() and file_path.stat().st_size > 0:
+                with open(file_path, 'rb') as f:
+                    f.read(1)
+                log.info(f"File found and verified: {file_path}")
+                return
+        except OSError as e:
+            log.warning(f"File {file_path} exists but is not ready (try {retry}): {e}")
+
+        if wait > 0:
+            time.sleep(wait)
+
+    raise TimeoutError(f"Timeout waiting for file to be ready: {file_path}")
 
 
 def munge_mount_handler():
@@ -223,8 +284,10 @@ def munge_mount_handler():
         raise err
 
     munge_key = Path(dirs.munge / "munge.key")
+    src_key = Path(mnt.local_mount / "munge.key")
+    wait_for_file(src_key)
     log.info(f"Copy munge.key from: {mnt.local_mount}")
-    shutil.copy2(Path(mnt.local_mount / "munge.key"), munge_key)
+    shutil.copy2(src_key, munge_key)
 
     log.info("Restrict permissions of munge.key")
     shutil.chown(munge_key, user="munge", group="munge")
@@ -258,7 +321,7 @@ def slurm_key_mount_handler():
             f"{mnt.server_ip}:{mnt.remote_mount}",
             str(mnt.local_mount),
         ]
-    timeout = 120 # wait max 120s to mount
+    timeout = 300 # wait max 300s to mount
     for retry, wait in enumerate(util.backoff_delay(0.5, timeout), 1):
         try:
             run(cmd, timeout=timeout)
@@ -275,8 +338,10 @@ def slurm_key_mount_handler():
 
     file_name = "slurm.key"
     dst = Path(util.slurmdirs.etc / file_name)
+    src_key = mnt.local_mount / file_name
+    wait_for_file(src_key)
     log.info(f"Copy slurm.key from: {mnt.local_mount}")
-    shutil.copy2(mnt.local_mount / file_name, dst)
+    shutil.copy2(src_key, dst)
 
     log.info("Restrict permissions of slurm.key")
     util.chown_slurm(dst, mode=0o400)
@@ -314,8 +379,12 @@ def setup_nfs_exports():
 
     # export path if corresponding selector boolean is True
     lines = []
-    for path,options in to_export.items():
+    for path, options in to_export.items():
         util.mkdirp(Path(path))
+        try:
+            os.chmod(Path(path), 0o755)
+        except OSError as e:
+            log.warning(f"Failed to set permissions for {path}: {e}")
         run(rf"sed -i '\#{path}#d' /etc/exports", timeout=30)
         lines.append(f"{path}  {options}")
 
@@ -324,4 +393,4 @@ def setup_nfs_exports():
     with (exportsd / "slurm.exports").open("w") as f:
         f.write("\n")
         f.write("\n".join(lines))
-    run("exportfs -a", timeout=30)
+    run("exportfs -ra", timeout=30)

@@ -11,7 +11,7 @@ This module allows you to run a series of gcloud commands as part of a Cluster T
     commands:
       - gcloud compute networks create my-network --subnet-mode=custom
       - gcloud compute networks subnets create my-subnet --network=my-network --range=10.0.0.0/24 --region=us-central1
-      - gcloud compute instances create my-vm --zone=us-central1-a --network=my-network --subnet=my-subnet --machine-type=e2-medium
+      - gcloud compute instances create my-vm --zone=us-central1-a --network=my-network --subnet=my-subnet --machine-type=n2d-standard-2
 ## Dependency Management
 
 This module uses `local-exec` provisioners to run `gcloud` commands. As such, it does not expose any outputs that other Terraform modules can consume to establish dependencies.
@@ -44,14 +44,14 @@ deployment_groups:
 ## Requirements
 
 | Name | Version |
-|------|---------|
-| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | = 1.12.2 |
+| ---- | ------- |
+| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.12.2 |
 | <a name="requirement_null"></a> [null](#requirement\_null) | >= 3.0 |
 
 ## Providers
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | <a name="provider_null"></a> [null](#provider\_null) | >= 3.0 |
 
 ## Modules
@@ -61,13 +61,13 @@ No modules.
 ## Resources
 
 | Name | Type |
-|------|------|
+| ---- | ---- |
 | [null_resource.gcloud_commands](https://registry.terraform.io/providers/hashicorp/null/latest/docs/resources/resource) | resource |
 
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
+| ---- | ----------- | ---- | ------- | :------: |
 | <a name="input_commands"></a> [commands](#input\_commands) | A list of gcloud command pairs for creation and destruction. | <pre>list(object({<br/>    create = string<br/>    delete = string<br/>  }))</pre> | `[]` | no |
 | <a name="input_module_instance_id"></a> [module\_instance\_id](#input\_module\_instance\_id) | The unique ID of this module instance in the blueprint. This is automatically populated by gcluster. | `string` | n/a | yes |
 

@@ -17,16 +17,20 @@
 
 from typing import List, Optional, Dict, Any
 import argparse
-from datetime import timedelta
+import random
+import time
+from datetime import datetime, timedelta
 import shlex
 import json
 import logging
+import error_handler
 import os
+import re
 import yaml
 import collections
 from pathlib import Path
 from dataclasses import dataclass
-from addict import Dict as NSDict # type: ignore
+from util import NSDict
 
 import util
 from util import (
@@ -62,6 +66,7 @@ class ResumeJobData:
     job_id: int
     partition: str
     nodes_alloc: List[str]
+    accelerator_topology: Optional[str] = None
 
 @dataclass(frozen=True)
 class ResumeData:
@@ -82,6 +87,8 @@ def get_resume_file_data() -> Optional[ResumeData]:
             job_id = jo.get("job_id"),
             partition = jo.get("partition"),
             nodes_alloc = util.to_hostnames(jo.get("nodes_alloc")),
+            # Parse topology from job layout (e.g., tpu7x=2x2x2 -> 2x2x2)
+            accelerator_topology = jo["layout"].split("=")[-1] if jo.get("layout") else None,
         )
         jobs.append(job)
     return ResumeData(jobs=jobs)
@@ -159,7 +166,7 @@ def dws_flex_duration(dws_flex: NSDict, job_id: Optional[int]) -> int:
             log.info("Job TimeLimit cannot be less than 30 seconds or exceed one week")
     return max_duration
 
-def create_instances_request(nodes: List[str], placement_group: Optional[str], excl_job_id: Optional[int]):
+def create_instances_request(nodes: List[str], placement_group: Optional[str], excl_job_id: Optional[int], is_job_request: bool):
     """Call regionInstances.bulkInsert to create instances"""
     assert 0 < len(nodes) <= BULK_INSERT_LIMIT
 
@@ -181,13 +188,17 @@ def create_instances_request(nodes: List[str], placement_group: Optional[str], e
         ),
     )
 
-    if placement_group and excl_job_id is not None:
-        pass # do not set minCount to force "all or nothing" behavior
+    if is_job_request:
+        # By omitting minCount, GCP will default minCount to equal count.
+        # This guarantees ATOMIC PROVISIONING. If GCP cannot provide all N nodes, it fails instantly
+        # rather than partially provisioning M nodes which waste budget while waiting for the rest.
+        pass
     else:
+        # Static pools and non-job allocations don't require all nodes to boot simultaneously.
+        # minCount=1 allows partial fulfillment so available static nodes can still service smaller jobs.
         body["minCount"] = 1
 
     zone_allow = nodeset.zone_policy_allow or []
-    zone_deny = nodeset.zone_policy_deny or []
 
     if len(zone_allow) == 1: # if only one zone is used, use zonal BulkInsert API, as less prone to errors
         api_method = lookup().compute.instances().bulkInsert
@@ -195,11 +206,10 @@ def create_instances_request(nodes: List[str], placement_group: Optional[str], e
     else:
         api_method = lookup().compute.regionInstances().bulkInsert
         method_args = {"region": lookup().node_region(model)}
-        
+
+        # The 'zones' parameter acts as an allow-list, implicitly denying any zones not included.
         body["locationPolicy"] = dict(
-            locations = {
-                **{ f"zones/{z}": {"preference": "ALLOW"} for z in zone_allow },
-                **{ f"zones/{z}": {"preference": "DENY"} for z in zone_deny }},
+            zones = [ { "zone": f"zones/{z}" } for z in zone_allow ],
             targetShape = nodeset.zone_target_shape,
         )
     
@@ -223,6 +233,7 @@ class BulkChunk:
     chunk_idx: int
     excl_job_id: Optional[int]
     placement_group: Optional[str] = None
+    is_job_request: bool = False
 
     @property
     def name(self):
@@ -242,21 +253,25 @@ def group_nodes_bulk(nodes: List[str], resume_data: Optional[ResumeData], lkp: u
     non_excl = nodes_set.copy()
     groups : Dict[Optional[int], List[PlacementAndNodes]] = {} # excl_job_id|none -> PlacementAndNodes
 
-    # expand all exclusive job nodelists
+    # expand all job nodelists (both exclusive and non-exclusive)
     for job in resume_data.jobs:
-        if not lkp.cfg.partitions[job.partition].enable_job_exclusive: 
+        # Intersect the job's allocated nodes with the nodes currently being resumed.
+        # This fixes a bug where partially provisioned nodes in previous resume calls were improperly included
+        # in the new bulkInsert, causing duplicate provisioning and blocking minCount atomic requests.
+        job_nodes_in_resume = set(job.nodes_alloc) & non_excl
+        if not job_nodes_in_resume:
             continue
 
         groups[job.job_id] = []
-        # placement group assignment is based on all allocated nodes, ...
+        # placement group assignment requires full job.nodes_alloc to be accurate
         for pn in create_placements(job.nodes_alloc, job.job_id, lkp):
             groups[job.job_id].append(
                 PlacementAndNodes(
                     placement=pn.placement,
-                    #... but we only want to handle nodes in nodes_resume in this run.
-                    nodes = sorted(set(pn.nodes) & nodes_set)
+                    # safely intersect with job_nodes_in_resume to prevent duplicate overlapping node requests
+                    nodes = sorted(set(pn.nodes) & job_nodes_in_resume)
                 ))
-        non_excl.difference_update(job.nodes_alloc)
+        non_excl.difference_update(job_nodes_in_resume)
 
     groups[None] = create_placements(sorted(non_excl), excl_job_id=None, lkp=lkp)
 
@@ -266,8 +281,18 @@ def group_nodes_bulk(nodes: List[str], resume_data: Optional[ResumeData], lkp: u
         
         model = nodes[0]
         
-        if lkp.is_flex_node(model):
+        # Group static TPU nodes by slice size so each slice gets its own MIG
+        if lkp.is_tpu_node(model) and lkp.is_static_node(model):
+            ns = lkp.node_nodeset(model)
+            chunk_size = lkp.get_tpu_chunk_size(ns)
+            chunks_dict = lkp.group_tpu_nodes_by_chunk_idx(nodes, chunk_size)
+            return [chunks_dict[idx] for idx in sorted(chunks_dict.keys())]
+        elif lkp.is_flex_node(model):
             chunk_size = ZONAL_MIG_SIZE_LIMIT
+        elif lkp.is_node_mig(model):
+            # Static MIG nodes handle multi-MIG routing and 1000-node createInstances
+            # batching internally. Keep in a single chunk to preserve atomic multi-shard rollback.
+            return [nodes]
         elif lkp.node_is_tpu(model):
             ns_name = lkp.node_nodeset_name(model)
             chunk_size = tpu.TPU.make(ns_name, lkp).vmcount
@@ -282,13 +307,233 @@ def group_nodes_bulk(nodes: List[str], resume_data: Optional[ResumeData], lkp: u
             prefix=lkp.node_prefix(nodes_chunk[0]), # <cluster_name>-<nodeset_name>
             excl_job_id = job_id,
             placement_group=pn.placement,
-            chunk_idx=i)
+            chunk_idx=i,
+            is_job_request=(job_id is not None))
 
         for job_id, placements in groups.items()
         for pn in placements if pn.nodes
         for i, nodes_chunk in enumerate(chunk_nodes(pn.nodes))
     ]
     return {chunk.name: chunk for chunk in chunks}
+
+
+def resume_mig_nodes(nodes: List[str], excl_job_id: Optional[int], lkp: util.Lookup, resume_data: Optional[ResumeData] = None) -> None:
+    """Provisions nodes via MIG createInstances with Per-Instance Config and preserved state."""
+    if not nodes:
+        return
+
+    # Group nodes by target MIG (to support multiple MIGs for >1000 nodes)
+    nodes_by_mig: Dict[str, List[str]] = {}
+    for node in nodes:
+        mig_name = lkp.node_mig_name(node)
+        nodes_by_mig.setdefault(mig_name, []).append(node)
+
+    successful_creates: List[str] = []
+    for mig_name, mig_nodes in nodes_by_mig.items():
+        nodeset = lkp.node_nodeset(mig_nodes[0])
+        region = lkp.node_region(mig_nodes[0])
+
+        log.info(f"Resuming {len(mig_nodes)} MIG nodes ({to_hostlist(mig_nodes)}) for MIG {mig_name}")
+
+        # 1. Drift-Aware Group Template Alignment
+        template_link = getattr(nodeset, "instance_template", None)
+        if template_link:
+            try:
+                mig = lkp.get_mig(lkp.project, region, mig_name)
+                if mig:
+                    current_template = (
+                        mig.get("instanceTemplate")
+                        or (mig.get("versions", [{}])[0].get("instanceTemplate") if mig.get("versions") else None)
+                    )
+                    if current_template and current_template.split("/")[-1] != template_link.split("/")[-1]:
+                        log.info(f"Updating MIG {mig_name} template: {current_template} -> {template_link}")
+                        ver_payload: Dict[str, Any] = {"instanceTemplate": template_link}
+                        if mig.get("versions") and mig["versions"][0].get("name"):
+                            ver_payload["name"] = mig["versions"][0]["name"]
+                        aic_req = lkp.compute.regionInstanceGroupManagers().patch(
+                            project=lkp.project,
+                            region=region,
+                            instanceGroupManager=mig_name,
+                            body={"versions": [ver_payload]}
+                        )
+                        aic_res = ensure_execute(aic_req)
+                        if isinstance(aic_res, dict) and "selfLink" in aic_res:
+                            op_res = wait_for_operation(aic_res)
+                            if op_res and "error" in op_res:
+                                raise RuntimeError(f"patch template operation failed: {op_res['error']}")
+                        lkp.get_mig.cache_clear()
+            except Exception as e:
+                log.warning(f"Could not verify/update template for MIG {mig_name}: {e}")
+
+        # 2. Per-Instance Config (PIC) - Lightweight instance name binding for static Slurm hostnames
+        existing_mig_insts = set()
+        deleting_mig_insts = set()
+        try:
+            mig_data = lkp.get_mig_instances(lkp.project, region, mig_name)
+            for m in mig_data.get("managedInstances", []):
+                name = m.get("name") or (m.get("instance") or "").split("/")[-1]
+                if m.get("currentAction") in ("DELETING", "ABANDONING") or m.get("instanceStatus") in ("STOPPING", "DELETING"):
+                    if name:
+                        deleting_mig_insts.add(name)
+                elif name:
+                    existing_mig_insts.add(name)
+        except Exception as e:
+            log.warning(f"Could not check existing instances for MIG {mig_name}: {e}")
+
+        # If any requested nodes are currently in the middle of being deleted by GCE,
+        # wait briefly for the deletion operation to finish so createInstances will not fail with 409 Conflict.
+        nodes_to_wait = {n.split(".")[0] for n in mig_nodes} & deleting_mig_insts
+        still_deleting = set(nodes_to_wait)
+        if nodes_to_wait:
+            log.info(f"Waiting for in-flight deletion of {nodes_to_wait} in MIG {mig_name} before resuming...")
+            for _ in range(10):
+                time.sleep(2)
+                lkp.get_mig_instances.cache_clear()
+                try:
+                    mig_data = lkp.get_mig_instances(lkp.project, region, mig_name)
+                    current_insts = {
+                        (m.get("name") or (m.get("instance") or "").split("/")[-1])
+                        for m in mig_data.get("managedInstances", [])
+                        if (m.get("name") or m.get("instance"))
+                    }
+                    still_deleting = nodes_to_wait & current_insts
+                    if not still_deleting:
+                        break
+                except Exception:
+                    pass
+            if still_deleting:
+                log.error(f"Instances {still_deleting} still deleting in GCE after timeout; failing resume to trigger immediate requeue.")
+                if excl_job_id is not None:
+                    if successful_creates:
+                        log.warning(
+                            f"Aborting multi-slice exclusive job {excl_job_id}: cleaning up {len(successful_creates)} previously created instances: {to_hostlist(successful_creates)}"
+                        )
+                        try:
+                            # Lazy import to avoid circular dependency between resume and suspend
+                            import suspend
+                            lkp.get_mig_instances.cache_clear()
+                            lkp.get_mig_repairing_instances.cache_clear()
+                            suspend.suspend_mig_nodes(successful_creates, lkp)
+                        except Exception as clean_err:
+                            log.error(f"Failed cleaning up instances {successful_creates}: {clean_err}")
+                    # Multi-node exclusive job cannot proceed without all nodes across all shards.
+                    # Reset all nodes in the request and abort createInstances immediately.
+                    all_short_nodes = [n.split(".")[0] for n in nodes]
+                    handle_resume_failure(
+                        all_short_nodes,
+                        "GCP MIG Error: Instances still in-flight deleting after timeout",
+                        resume_data,
+                        error_handler.Action.REQUEUE,
+                        "MIG in-flight deletion timeout",
+                    )
+                    return
+                else:
+                    # For non-exclusive/jobless nodes, identify all affected jobs and cancel their associated nodes
+                    affected_nodes = set(still_deleting)
+                    if resume_data:
+                        for job in resume_data.jobs:
+                            job_nodes = {n.split(".")[0] for n in job.nodes_alloc}
+                            if job_nodes & still_deleting:
+                                affected_nodes.update(job_nodes)
+                    nodes_to_fail = [n.split(".")[0] for n in mig_nodes if n.split(".")[0] in affected_nodes]
+                    handle_resume_failure(
+                        nodes_to_fail,
+                        "GCP MIG Error: Instances still in-flight deleting after timeout",
+                        resume_data,
+                        error_handler.Action.REQUEUE,
+                        "MIG in-flight deletion timeout",
+                    )
+                    existing_mig_insts.update(affected_nodes)
+
+        pic_instances: List[Dict[str, Any]] = []
+        seen_names = set()
+        for node in mig_nodes:
+            short_name = node.split(".")[0]
+            if short_name in existing_mig_insts or short_name in seen_names:
+                log.info(f"Instance {short_name} already exists in MIG {mig_name} or duplicate; skipping createInstances.")
+                continue
+            seen_names.add(short_name)
+            inst: Dict[str, Any] = {"name": short_name}
+            if excl_job_id is not None:
+                inst["preservedState"] = {
+                    "metadata": {
+                        "slurm_job_id": str(excl_job_id)
+                    }
+                }
+            pic_instances.append(inst)
+
+        if not pic_instances:
+            log.info(f"All requested nodes already exist in MIG {mig_name}; nothing to create.")
+            continue
+
+        for chunk in chunked(pic_instances, n=ZONAL_MIG_SIZE_LIMIT):
+            chunk_nodes = [item["name"] for item in chunk]
+            # False only while the outcome is unknown (request accepted, operation not yet
+            # observed terminal). Deleting there would kill healthy VMs.
+            observed_terminal_failure = True
+            try:
+                pic_req = lkp.compute.regionInstanceGroupManagers().createInstances(
+                    project=lkp.project,
+                    region=region,
+                    instanceGroupManager=mig_name,
+                    body={"instances": chunk}
+                )
+                res = ensure_execute(pic_req)
+                log.debug(f"createInstances submitted for {mig_name}: {res}")
+                if isinstance(res, dict) and "selfLink" in res:
+                    observed_terminal_failure = False
+                    op_res = wait_for_operation(res)
+                    observed_terminal_failure = True
+                    if op_res and "error" in op_res:
+                        raise RuntimeError(f"createInstances operation failed: {op_res['error']}")
+                log.debug(f"createInstances completed for {mig_name}")
+                lkp.get_mig_instances.cache_clear()
+                lkp.get_mig_repairing_instances.cache_clear()
+                successful_creates.extend(chunk_nodes)
+            except Exception as e:
+                log.error(f"Failed createInstances for MIG {mig_name} on nodes {to_hostlist(chunk_nodes)}: {e}")
+                reason = getattr(e, "_get_reason", lambda: str(e))()
+                action, admin_comment = error_handler.classify_gcp_error(reason, str(e))
+                nodes_to_cleanup = (
+                    list(dict.fromkeys(successful_creates + chunk_nodes))
+                    if excl_job_id is not None
+                    else list(chunk_nodes)
+                )
+                deferred_reclaim = bool(nodes_to_cleanup) and not observed_terminal_failure
+                if deferred_reclaim:
+                    log.warning(
+                        f"createInstances outcome unobserved for {to_hostlist(nodes_to_cleanup)}; "
+                        f"skipping inline cleanup, deferring reclamation to the suspend path."
+                    )
+                    nodes_to_cleanup = []
+                    # Only REQUEUE issues `state=power_down`, which runs SuspendProgram.
+                    # `state=down` alone may never reclaim the VMs we declined to delete.
+                    action = error_handler.Action.REQUEUE
+                    admin_comment = "MIG createInstances outcome unobserved; requeued so suspend reclaims instances"
+                if nodes_to_cleanup:
+                    log.warning(
+                        f"Cleaning up {len(nodes_to_cleanup)} failed/aborted MIG instances: {to_hostlist(nodes_to_cleanup)}"
+                    )
+                    try:
+                        # Lazy import to avoid circular dependency between resume and suspend
+                        import suspend
+                        lkp.get_mig_instances.cache_clear()
+                        lkp.get_mig_repairing_instances.cache_clear()
+                        suspend.suspend_mig_nodes(nodes_to_cleanup, lkp)
+                    except Exception as clean_err:
+                        log.error(f"Failed cleaning up instances {nodes_to_cleanup}: {clean_err}")
+                failed_nodes = [n.split(".")[0] for n in nodes] if excl_job_id is not None else chunk_nodes
+                handle_resume_failure(
+                    failed_nodes,
+                    f"GCP Error: {reason}",
+                    resume_data,
+                    action,
+                    admin_comment,
+                )
+                if excl_job_id is not None:
+                    return
+            finally:
+                lkp.get_mig_instances.cache_clear()
 
 
 def resume_nodes(nodes: List[str], resume_data: Optional[ResumeData]):
@@ -321,23 +566,68 @@ def resume_nodes(nodes: List[str], resume_data: Optional[ResumeData]):
             "node bulk groups: \n{}".format(yaml.safe_dump(grouped_nodelists).rstrip())
         )
 
-    tpu_chunks, flex_chunks = [], []
+    tpu_chunks, gce_tpu_chunks, flex_chunks, mig_chunks = [], [], [], []
     bi_inserts = {}
 
     for group, chunk in grouped_nodes.items():
         model = chunk.nodes[0]
 
-        if lkp.node_is_tpu(model):
+        if lkp.is_tpu_node(model):
+            gce_tpu_chunks.append(chunk)
+        elif lkp.node_is_tpu(model):
             tpu_chunks.append(chunk.nodes)
         elif lkp.is_flex_node(model):
             flex_chunks.append(chunk)
+        elif lkp.is_node_mig(model):
+            mig_chunks.append(chunk)
         else:
             bi_inserts[group] = create_instances_request(
-                chunk.nodes, chunk.placement_group, chunk.excl_job_id
+                chunk.nodes, chunk.placement_group, chunk.excl_job_id, chunk.is_job_request
             )
 
+    for chunk in gce_tpu_chunks:
+        try:
+            job_topo = None
+            if resume_data and chunk.excl_job_id is not None:
+                for job in resume_data.jobs:
+                    if job.job_id == chunk.excl_job_id and job.accelerator_topology:
+                        job_topo = job.accelerator_topology
+                        break
+            mig_flex.resume_tpu_chunk(chunk.nodes, chunk.excl_job_id, lkp, topology=job_topo)
+        except Exception as tpu_exc:
+            err_msg = str(tpu_exc)
+            reason = getattr(tpu_exc, "_get_reason", lambda: err_msg)()
+            _, admin_comment = error_handler.classify_gcp_error(reason, err_msg)
+            # Notify the job before marking nodes down so srun prints the error
+            if chunk.excl_job_id is not None:
+                run(f"{lkp.scontrol} update jobid={chunk.excl_job_id} admincomment={shlex.quote(admin_comment)}", check=False)
+                run(f"{lkp.scontrol} notify {chunk.excl_job_id} {shlex.quote(admin_comment)}", check=False)
+                time.sleep(1.0)
+            # Reset nodes back to idle~ and cancel the job if the config/layout was invalid
+            is_invalid = "INVALID_FIELD_VALUE" in err_msg
+            handle_resume_failure(
+                chunk.nodes,
+                f"GCP TPU Error: {err_msg}",
+                None,
+                error_handler.Action.REQUEUE,
+                admin_comment,
+            )
+            if chunk.excl_job_id is not None and is_invalid:
+                scancel_bin = str(Path(lkp.scontrol).with_name("scancel"))
+                run(f"{scancel_bin} {chunk.excl_job_id}", check=False)
+
     for chunk in flex_chunks:
-        mig_flex.resume_flex_chunk(chunk.nodes, chunk.excl_job_id, lkp)
+        try:
+            mig_flex.resume_flex_chunk(chunk.nodes, chunk.excl_job_id, lkp, chunk.placement_group)
+        except Exception:
+            log.exception(f"failed to resume flex chunk {chunk.nodes}")
+
+    for chunk in mig_chunks:
+        try:
+            resume_mig_nodes(chunk.nodes, chunk.excl_job_id, lkp, resume_data)
+        except Exception:
+            log.exception(f"failed to resume MIG chunk {chunk.nodes}")
+
 
     # execute all bulkInsert requests  with batch
     bulk_ops = dict(
@@ -354,7 +644,20 @@ def resume_nodes(nodes: List[str], resume_data: Optional[ResumeData]):
         failed_reqs = [str(e) for e in failed.items()]
         log.error("bulkInsert API failures: {}".format("; ".join(failed_reqs)))
         for ident, exc in failed.items():
-            down_nodes_notify_jobs(grouped_nodes[ident].nodes, f"GCP Error: {exc._get_reason()}", resume_data) # type: ignore
+            reason = exc._get_reason() if hasattr(exc, "_get_reason") else str(exc) # type: ignore
+            details = reason
+            err_details = getattr(exc, "error_details", None)
+            if err_details:
+                if isinstance(err_details, list):
+                    details = "; ".join(
+                        err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                        for err in err_details
+                    )
+                else:
+                    details = str(err_details)
+            
+            action, admin_comment = error_handler.classify_gcp_error(reason, details)
+            handle_resume_failure(grouped_nodes[ident].nodes, f"GCP Error: {reason}", resume_data, action, admin_comment)
 
     if log.isEnabledFor(logging.DEBUG):
         for group, op in started.items():
@@ -450,7 +753,8 @@ def _handle_bulk_insert_op(op: Dict, nodes: List[str], resume_data: Optional[Res
             for err in failed_ops[0]["error"]["errors"]
         )
         if code != "RESOURCE_ALREADY_EXISTS":
-            down_nodes_notify_jobs(failed_nodes, f"GCP Error: {msg}", resume_data)
+            action, admin_comment = error_handler.classify_gcp_error(code, msg)
+            handle_resume_failure(failed_nodes, f"GCP Error: {msg}", resume_data, action, admin_comment)
         log.error(
             f"errors from insert for node '{failed_nodes[0]}' ({failed_ops[0]['name']}): {msg}"
         )
@@ -471,24 +775,146 @@ def down_nodes_notify_jobs(nodes: List[str], reason: str, resume_data: Optional[
     nodelist = util.to_hostlist(nodes)
     log.error(f"Marking nodes {nodelist} as DOWN, reason: {reason}")
     run(f"{lookup().scontrol} update nodename={nodelist} state=down reason={reason_quoted}", check=False)
-    
-    
 
 
-def create_placement_request(pg_name: str, region: str, max_distance: Optional[int], accelerator_topology: Optional[str]):
-    config = {
-        "name": pg_name,
-        "region": region,
-        "groupPlacementPolicy": {
-            "collocation": "COLLOCATED",
-            "maxDistance": max_distance,
-            "gpuTopology": accelerator_topology,
-        },
-    }
+def handle_resume_failure(nodes: List[str], reason: str, resume_data: Optional[ResumeData], action: error_handler.Action, admin_comment: str) -> None:
+    """Handle resume failures via node and job management based on error action."""
+    nodes_set = set(nodes)
+    jobs = resume_data.jobs if resume_data else []
+    
+    admin_reason_quoted = shlex.quote(admin_comment)
+    fallback_reason_quoted = shlex.quote(reason)
+
+    nodelist = util.to_hostlist(nodes)
+    if action == error_handler.Action.REQUEUE:
+        log.error(f"Resetting nodes {nodelist} to power_down. Reason: {reason}")
+        # 1. Force DOWN to instantly strip the POWERING_UP (#) flag and bypass ResumeTimeout
+        run(f"{lookup().scontrol} update nodename={nodelist} state=down reason='Force clear booting state'", check=False)
+        # 2. Return to power_down so Slurm transitions it safely to idle~
+        run(f"{lookup().scontrol} update nodename={nodelist} state=power_down", check=False)
+    else:
+        log.error(f"Marking nodes {nodelist} as DOWN. Reason: {reason}")
+        run(f"{lookup().scontrol} update nodename={nodelist} state=down reason={fallback_reason_quoted}", check=False)
+
+    jobs_to_requeue = []
+    for job in jobs:
+        if not (set(job.nodes_alloc) & nodes_set):
+            continue
+            
+        run(f"{lookup().scontrol} update jobid={job.job_id} admincomment={admin_reason_quoted}", check=False)
+
+        if action == error_handler.Action.REQUEUE:
+            jobs_to_requeue.append(job)
+
+    if jobs_to_requeue:
+        # Safely extract ID from Slurm JSON dicts or legacy primitives
+        def extract_json_id(val) -> str:
+            if isinstance(val, dict):
+                return str(val.get("number", "0"))
+            return str(val) if val else "0"
+
+        pending_jobs = set()
+        parent_job_ids = {}
+        
+        # Wait up to 10 seconds for jobs to natively requeue to PENDING
+        for _ in range(10):
+            remaining_ids = [str(job.job_id) for job in jobs_to_requeue if str(job.job_id) not in pending_jobs]
+            if not remaining_ids:
+                break
+
+            for ids_chunk in util.chunked(remaining_ids, 1000):
+                try:
+                    res = run(f"{lookup().scontrol} show job {','.join(ids_chunk)} --json", check=False)
+                    if not (res and res.stdout): 
+                        raise RuntimeError(f"scontrol show job returned empty output. (code={getattr(res, 'returncode', 'None')}, stderr={getattr(res, 'stderr', 'None')})")
+                        
+                    data = json.loads(res.stdout)
+                    for job_dict in data.get("jobs", []):
+                        state = job_dict.get("job_state", "")
+                        # Unlike sbatch, interactive srun jobs fail immediately and won't be in PENDING state
+                        if "PENDING" in state:
+                            job_id = extract_json_id(job_dict.get("job_id"))
+                            pending_jobs.add(job_id)
+                            parent_id = job_id
+                            arr_id = extract_json_id(job_dict.get("array_job_id"))
+                            het_id = extract_json_id(job_dict.get("het_job_id") or job_dict.get("pack_job_id"))
+                            # Ignore "0" and "0_0" for unset array/het IDs
+                            if arr_id not in ("0", "0_0"):
+                                parent_id = arr_id
+                            elif het_id not in ("0", "0_0"):
+                                parent_id = het_id
+                            parent_job_ids[job_id] = parent_id
+                except Exception as e:
+                    log.debug(f"Failed to query job states: {e}")
+
+            if len(pending_jobs) == len(jobs_to_requeue):
+                break
+            time.sleep(1)
+
+        jobs_by_backoff_time = collections.defaultdict(list)
+        # Define globally so grouped jobs share the exact same backoff time
+        base_timestamp = datetime.now().replace(microsecond=0)
+
+        for job in jobs_to_requeue:
+            job_id = str(job.job_id)
+            if job_id not in pending_jobs:
+                continue
+
+            # Use parent job ID (array/het) as seed value so grouped jobs generate identical random backoffs
+            seed_val = parent_job_ids.get(job_id, job_id)
+            random_generator = random.Random(seed_val)
+
+            # To prevent the requeued jobs from immediately retrying and hammering
+            # the GCP API during a stockout, we calculate a randomized backoff (e.g. 1-2 mins) and
+            # explicitly delay the job's next evaluation via the StartTime parameter.
+            delay_seconds = random_generator.randint(60, 120)
+
+            backoff_time = (base_timestamp + timedelta(seconds=delay_seconds)).strftime("%Y-%m-%dT%H:%M:%S")
+            jobs_by_backoff_time[backoff_time].append(job_id)
+            log.info(f"Setting job {job_id} backoff: {delay_seconds}s (until {backoff_time})")
+
+        # Batch execute the StartTime updates to prevent massive subprocess generation
+        for backoff_time, job_ids in jobs_by_backoff_time.items():
+            for ids_chunk in util.chunked(job_ids, 1000):
+                run(f"{lookup().scontrol} update JobId={','.join(ids_chunk)} StartTime={backoff_time}", check=False)
+
+
+def create_placement_request(pg_name: str, region: str, max_distance: Optional[int], accelerator_topology: Optional[str], is_flex: bool = False):
+    if is_flex:
+        distance_map = {
+            1: "SUBBLOCK",
+            2: "BLOCK",
+            3: "CLUSTER",
+        }
+        topo_distance = "CLUSTER"
+        if max_distance in distance_map:
+            topo_distance = distance_map[max_distance]
+        
+
+        config = {
+            "name": pg_name,
+            "region": region,
+            "workloadPolicy": {
+                "type": "HIGH_THROUGHPUT",
+                "maxTopologyDistance": topo_distance,
+            },
+        }
+
+    else:
+        config = {
+            "name": pg_name,
+            "region": region,
+            "groupPlacementPolicy": {
+                "collocation": "COLLOCATED",
+                "maxDistance": max_distance,
+                "gpuTopology": accelerator_topology,
+            },
+        }
     
     request = lookup().compute.resourcePolicies().insert(
         project=lookup().project, region=region, body=config
     )
+
     log_api_request(request)
     return request
 
@@ -511,17 +937,21 @@ def _allocate_nodes_to_placements(nodes: List[str], excl_job_id:Optional[int], l
     model = nodes[0]
     nodeset = lkp.node_nodeset(model)
 
-    is_slice = bool(getattr(nodeset, 'accelerator_topology', None))
+    # Static MIG NodeSets already have their Workload Policies provisioned by Terraform
+    # and bound to each slice MIG. Skip runtime GCE placement policy allocation.
+    # GCE TPU nodesets get their workload policy from mig_flex at resume time, so skip them too.
+    # (Note: DWS Flex NodeSets must continue to runtime placement policy allocation).
+    if lkp.is_tpu_node(model) or lkp.node_is_tpu(model) or (lkp.is_node_mig(model) and not lkp.is_flex_node(model)):
+        return no_pp
+
+    topo = nodeset.get("accelerator_topology") if isinstance(nodeset, dict) else getattr(nodeset, "accelerator_topology", None)
+    is_slice = bool(topo)
 
     excl_job_placement = (excl_job_id is not None) and (not is_slice)
     
     if excl_job_placement and len(nodes) < 2:
         return no_pp # don't create placement_policy for just one node
 
-    if lkp.is_flex_node(model):
-        return no_pp # TODO(FLEX): Add support for workload policies 
-    if lkp.node_is_tpu(model):
-        return no_pp
     if not (nodeset.enable_placement and valid_placement_node(model)):
         return no_pp
     
@@ -562,38 +992,48 @@ def _allocate_nodes_to_placements(nodes: List[str], excl_job_id:Optional[int], l
 def calculate_hosts_per_topo(accelerator_topology: str, machine_type: NSDict) -> int:
     # Calculate total number of hosts per topology (Assumes format: '1x72')
     try:
-        top_split = [int(x) for x in accelerator_topology.split("x")]
+        top_split = [int(x) for x in accelerator_topology.lower().strip().split("x")]
     except Exception as e:
         log.error(f"Accelerator topology {accelerator_topology} is formatted incorrectly.")
         raise e
 
-    if len(machine_type.accelerators) == 0:
-        gpus_per_machine = 0
-    else: 
+    if len(machine_type.accelerators) > 0:
         gpus_per_machine = machine_type.accelerators[0].count
+    else:
+        m = re.search(r"-([0-9]+)g\b", str(getattr(machine_type, "name", "")))
+        gpus_per_machine = int(m.group(1)) if m else 0
 
-    if len(top_split) != 2:
+    if len(top_split) != 2 or top_split[0] <= 0 or top_split[1] <= 0:
         log.error(f"Accelerator topology {accelerator_topology} is formatted incorrectly.")
-    elif top_split[0] <= 0 or top_split[1] <= 0:
-        log.error(f"Accelerator topology {accelerator_topology} is formatted incorrectly.")
+        raise ValueError(f"Accelerator topology {accelerator_topology} is formatted incorrectly; expected '<dim1>x<dim2>'.")
     elif gpus_per_machine <= 0:
         log.error(f"The machine type has no accelerators. Cannot use accelerator topology {accelerator_topology}.")
+        raise ValueError(f"Machine type has no accelerators; cannot compute hosts for topology {accelerator_topology}")
     elif top_split[1] % gpus_per_machine:
         log.error(f"The GPU count {gpus_per_machine} per node is not a factor of the accelerator topology {accelerator_topology}")
+        raise ValueError(f"The GPU count {gpus_per_machine} per node is not a factor of the accelerator topology {accelerator_topology}")
     
     return (top_split[0] * top_split[1]) // gpus_per_machine
  
 def calculate_chunk_size(nodeset: NSDict, lkp: util.Lookup) -> int:
     # Calculates the chunk size based on max distance value received or accelerator topology
     # Assuming nodeset is not tpu
+    accelerator_topology = nodeset.get("accelerator_topology") if isinstance(nodeset, dict) else getattr(nodeset, "accelerator_topology", None)
+    if accelerator_topology:
+        slice_val = nodeset.get("slice_size") if isinstance(nodeset, dict) else getattr(nodeset, "slice_size", None)
+        if slice_val:  # static MIG only; same value partition.tf sharded on
+            try:
+                return max(1, int(slice_val))
+            except (ValueError, TypeError):
+                pass
+        # Bulk Insert / DWS Flex: derive from the live machine type, as before. Not
+        # lkp.nodeset_slice_size() -- it prefers config gpu_count, moving the source of truth.
+        template_link = nodeset.get("instance_template") if isinstance(nodeset, dict) else getattr(nodeset, "instance_template", None)
+        machine_type = lkp.template_info(template_link).machine_type
+        return calculate_hosts_per_topo(accelerator_topology, machine_type)
+
     machine_type = lkp.template_info(nodeset.instance_template).machine_type
     max_distance = nodeset.placement_max_distance
-    accelerator_topology = nodeset.accelerator_topology
-
-    # Look for accelerator topology first
-    if accelerator_topology:
-        hosts_per_topo = calculate_hosts_per_topo(accelerator_topology, machine_type)
-        return hosts_per_topo
 
     if max_distance == 1:
         return 22
@@ -609,9 +1049,16 @@ def calculate_chunk_size(nodeset: NSDict, lkp: util.Lookup) -> int:
 
 def create_nodeset_placements(nodes: List[str], excl_job_id:Optional[int], lkp: util.Lookup) -> List[PlacementAndNodes]:    
     placements = _allocate_nodes_to_placements(nodes, excl_job_id, lkp)
+    # Static MIG NodeSets already have their Workload Policies provisioned by Terraform
+    # and bound to each slice MIG. Skip runtime GCE compute.resourcePolicies.insert API requests.
+    if lkp.is_node_mig(nodes[0]) and not lkp.is_flex_node(nodes[0]):
+        return placements
+
     region = lkp.node_region(nodes[0])
-    max_distance = lkp.node_nodeset(nodes[0]).get('placement_max_distance')
+    ns = lkp.node_nodeset(nodes[0])
+    max_distance = getattr(ns, 'placement_max_distance', None) if not isinstance(ns, dict) else ns.get('placement_max_distance')
     accelerator_topology = lkp.nodeset_accelerator_topology(lkp.node_nodeset_name(nodes[0]))
+    is_flex = lkp.is_flex_node(nodes[0])
 
     if log.isEnabledFor(logging.DEBUG):
         debug_p = {p.placement: to_hostlist(p.nodes) for p in placements}
@@ -620,8 +1067,9 @@ def create_nodeset_placements(nodes: List[str], excl_job_id:Optional[int], lkp: 
         )
 
     requests = {
-        p.placement: create_placement_request(p.placement, region, max_distance, accelerator_topology) for p in placements if p.placement
+        p.placement: create_placement_request(p.placement, region, max_distance, accelerator_topology, is_flex) for p in placements if p.placement
     }
+
     if not requests:
         return placements
     # TODO: aggregate all requests for whole resume and execute them at once (don't limit to nodeset/job)

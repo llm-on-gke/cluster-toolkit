@@ -68,7 +68,7 @@ variable "instance_image" {
     EOD
   type        = map(string)
   default = {
-    family  = "slurm-gcp-6-12-hpc-rocky-linux-8"
+    family  = "slurm-gcp-6-12-hpc-rocky-linux-9"
     project = "schedmd-slurm-public"
   }
 
@@ -123,6 +123,12 @@ variable "disk_type" {
   default     = "pd-standard"
 }
 
+variable "disk_storage_pool" {
+  description = "Storage pool to use for the boot disk. Note that storage pools are only supported with Hyperdisk types. For boot disks, only hyperdisk-balanced is supported. You must provide an existing storage pool, as this module does not create new ones."
+  type        = string
+  default     = null
+}
+
 variable "disk_size_gb" {
   description = "Size of boot disk to create for the partition compute nodes."
   type        = number
@@ -144,13 +150,14 @@ variable "disk_labels" {
 variable "additional_disks" {
   description = "Configurations of additional disks to be included on the partition nodes."
   type = list(object({
-    disk_name    = string
-    device_name  = string
-    disk_size_gb = number
-    disk_type    = string
-    disk_labels  = map(string)
-    auto_delete  = bool
-    boot         = bool
+    disk_name         = string
+    device_name       = string
+    disk_size_gb      = number
+    disk_type         = string
+    disk_storage_pool = optional(string)
+    disk_labels       = map(string)
+    auto_delete       = bool
+    boot              = bool
   }))
   default = []
 }
@@ -342,28 +349,55 @@ variable "subnetwork_self_link" {
 }
 
 variable "additional_networks" {
-  description = "Additional network interface details for GCE, if any."
+  description = "Additional network interface details for GCE, if any. For Private Service Connect interfaces, 'network_attachment' must be the full resource URI: projects/{project}/regions/{region}/networkAttachments/{name}."
   default     = []
   type = list(object({
-    network            = string
-    subnetwork         = string
-    subnetwork_project = string
-    network_ip         = string
-    nic_type           = string
-    stack_type         = string
-    queue_count        = number
-    access_config = list(object({
+    network            = optional(string)
+    subnetwork         = optional(string)
+    subnetwork_project = optional(string)
+    network_attachment = optional(string)
+    network_ip         = optional(string, "")
+    nic_type           = optional(string)
+    stack_type         = optional(string)
+    queue_count        = optional(number)
+    access_config = optional(list(object({
       nat_ip       = string
       network_tier = string
-    }))
-    ipv6_access_config = list(object({
+    })), [])
+    ipv6_access_config = optional(list(object({
       network_tier = string
-    }))
-    alias_ip_range = list(object({
+    })), [])
+    alias_ip_range = optional(list(object({
       ip_cidr_range         = string
       subnetwork_range_name = string
-    }))
+    })), [])
   }))
+  validation {
+    condition = alltrue([
+      for nic in var.additional_networks : (
+        # Cannot specify network or subnetwork alongside network_attachment
+        !(((nic.network != null && nic.network != "") || (nic.subnetwork != null && nic.subnetwork != "")) && (nic.network_attachment != null && nic.network_attachment != "")) &&
+        # Cannot specify subnetwork_project, access_config, ipv6_access_config, or alias_ip_range alongside network_attachment
+        (nic.network_attachment == null || nic.network_attachment == "" || (
+          (nic.subnetwork_project == null || nic.subnetwork_project == "") &&
+          length(try(nic.access_config, [])) == 0 &&
+          length(try(nic.ipv6_access_config, [])) == 0 &&
+          length(try(nic.alias_ip_range, [])) == 0
+        )) &&
+        # Must specify at least one of network, subnetwork, or network_attachment
+        ((nic.network != null && nic.network != "") || (nic.subnetwork != null && nic.subnetwork != "") || (nic.network_attachment != null && nic.network_attachment != ""))
+      )
+    ])
+    error_message = "In var.additional_networks, you must specify at least one of 'network', 'subnetwork', or 'network_attachment'. When 'network_attachment' is set, you cannot specify 'network', 'subnetwork', 'subnetwork_project', 'access_config', 'ipv6_access_config', or 'alias_ip_range'."
+  }
+  validation {
+    condition = alltrue([
+      for nic in var.additional_networks : (
+        nic.network_attachment == null || nic.network_attachment == "" || can(regex("^(?:https://www.googleapis.com/compute/[^/]+/)?projects/[^/]+/regions/[^/]+/networkAttachments/[^/]+$", nic.network_attachment))
+      )
+    ])
+    error_message = "In var.additional_networks, 'network_attachment' must be the full resource URI: projects/{project}/regions/{region}/networkAttachments/{name}."
+  }
 }
 
 variable "access_config" {
@@ -392,11 +426,19 @@ variable "universe_domain" {
 variable "network_storage" {
   description = "An array of network attached storage mounts to be configured on nodes."
   type = list(object({
-    server_ip     = string,
-    remote_mount  = string,
-    local_mount   = string,
-    fs_type       = string,
-    mount_options = string,
+    server_ip               = string,
+    remote_mount            = string,
+    local_mount             = string,
+    local_mount_owner       = optional(string)
+    local_mount_permissions = optional(string)
+    fs_type                 = string,
+    mount_options           = string,
   }))
   default = []
+}
+
+variable "machine_configs" {
+  description = "Definition of GCE machine types and counts"
+  type        = any
+  default     = {}
 }

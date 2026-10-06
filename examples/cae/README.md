@@ -202,8 +202,8 @@ Depending on the software you want to use, different installation paths may be r
   that illustrate this process.
 
   In general, you need to bring the binaries to your CAE cluster for which it is
-  useful to use a Google Clouds Storage bucket, which is accessible from any machine using the
-  gsutil command and which can be mounted in the cluster.
+  useful to use a Google Cloud Storage bucket, which is accessible from any machine using the
+  `gcloud storage` commands or mounted directly in the cluster.
 
   As this installation process only needs to be done once and at the same time may require time,
   we recommend to do this installation in a separate deployment group before you bring up the cluster.
@@ -222,7 +222,7 @@ Depending on the software you want to use, different installation paths may be r
   ```
 
   where you can follow the installation steps manually. Or using the toolkit's
-  [startup-script](../../modules/scripts/startup-scripts/README.md) module, the process
+  [startup-script](../../modules/scripts/startup-script/README.md) module, the process
   can be automated.
 
   Once that is completed, the software will persist on the NFS Filestore share for as long as you

@@ -18,37 +18,40 @@ When prompted for project, use integration test project.
 ## Requirements
 
 | Name | Version |
-|------|---------|
-| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | = 1.12.2 |
+| ---- | ------- |
+| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.12.2 |
 | <a name="requirement_external"></a> [external](#requirement\_external) | ~> 2.3.0 |
 | <a name="requirement_google"></a> [google](#requirement\_google) | ~> 5.0 |
 
 ## Providers
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | <a name="provider_external"></a> [external](#provider\_external) | ~> 2.3.0 |
 | <a name="provider_google"></a> [google](#provider\_google) | ~> 5.0 |
+| <a name="provider_terraform"></a> [terraform](#provider\_terraform) | n/a |
 
 ## Modules
 
 | Name | Source | Version |
-|------|--------|---------|
+| ---- | ------ | ------- |
 | <a name="module_daily_image_test_runner_schedule"></a> [daily\_image\_test\_runner\_schedule](#module\_daily\_image\_test\_runner\_schedule) | ./trigger-schedule | n/a |
 | <a name="module_daily_project_cleanup_filestore_schedule"></a> [daily\_project\_cleanup\_filestore\_schedule](#module\_daily\_project\_cleanup\_filestore\_schedule) | ./trigger-schedule | n/a |
 | <a name="module_daily_project_cleanup_schedule"></a> [daily\_project\_cleanup\_schedule](#module\_daily\_project\_cleanup\_schedule) | ./trigger-schedule | n/a |
 | <a name="module_daily_project_cleanup_slurm_schedule"></a> [daily\_project\_cleanup\_slurm\_schedule](#module\_daily\_project\_cleanup\_slurm\_schedule) | ./trigger-schedule | n/a |
 | <a name="module_daily_test_schedule"></a> [daily\_test\_schedule](#module\_daily\_test\_schedule) | ./trigger-schedule | n/a |
+| <a name="module_daily_test_schedule_exceptions"></a> [daily\_test\_schedule\_exceptions](#module\_daily\_test\_schedule\_exceptions) | ./trigger-schedule | n/a |
 | <a name="module_weekly_build_dependency_check_schedule"></a> [weekly\_build\_dependency\_check\_schedule](#module\_weekly\_build\_dependency\_check\_schedule) | ./trigger-schedule | n/a |
 
 ## Resources
 
 | Name | Type |
-|------|------|
+| ---- | ---- |
 | [google_cloudbuild_trigger.daily_project_cleanup](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/cloudbuild_trigger) | resource |
 | [google_cloudbuild_trigger.daily_project_cleanup_filestore](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/cloudbuild_trigger) | resource |
 | [google_cloudbuild_trigger.daily_project_cleanup_slurm](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/cloudbuild_trigger) | resource |
 | [google_cloudbuild_trigger.daily_test](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/cloudbuild_trigger) | resource |
+| [google_cloudbuild_trigger.daily_test_exceptions](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/cloudbuild_trigger) | resource |
 | [google_cloudbuild_trigger.image_build_test_runner](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/cloudbuild_trigger) | resource |
 | [google_cloudbuild_trigger.pr_go_build_test](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/cloudbuild_trigger) | resource |
 | [google_cloudbuild_trigger.pr_ofe_test](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/cloudbuild_trigger) | resource |
@@ -60,12 +63,16 @@ When prompted for project, use integration test project.
 | [google_cloudbuild_trigger.zebug_fast_build_success](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/cloudbuild_trigger) | resource |
 | [google_compute_reservation.c2standard60_us_west4_c](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/compute_reservation) | resource |
 | [google_compute_reservation.n1standard8_with_tesla_t4_europe_west1_d](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/compute_reservation) | resource |
+| [terraform_data.apply_kueue_locks](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
 | [external_external.list_tests_midnight](https://registry.terraform.io/providers/hashicorp/external/latest/docs/data-sources/external) | data source |
 
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
+| ---- | ----------- | ---- | ------- | :------: |
+| <a name="input_daily_tests_dev_exceptions"></a> [daily\_tests\_dev\_exceptions](#input\_daily\_tests\_dev\_exceptions) | List of daily tests that must run in hpc-toolkit-dev in addition to hpc-toolkit-dev-2 (e.g. due to hardware reservations or quota constraints) | `set(string)` | <pre>[<br/>  "gke-g4-confidential",<br/>  "gke-tpu-7x"<br/>]</pre> | no |
+| <a name="input_daily_tests_project_id"></a> [daily\_tests\_project\_id](#input\_daily\_tests\_project\_id) | The GCP project for daily tests | `string` | `"hpc-toolkit-dev-2"` | no |
+| <a name="input_daily_tests_service_account"></a> [daily\_tests\_service\_account](#input\_daily\_tests\_service\_account) | The service account to run daily tests under. If null, the default Cloud Build service account is used. For projects enforcing BYOSA (like hpc-toolkit-dev-2), you must set this via environment variable, e.g. export TF\_VAR\_daily\_tests\_service\_account="projects/..." | `string` | `null` | no |
 | <a name="input_project_id"></a> [project\_id](#input\_project\_id) | GCP project ID | `string` | `"hpc-toolkit-dev"` | no |
 | <a name="input_region"></a> [region](#input\_region) | GCP region | `string` | `"us-central1"` | no |
 | <a name="input_repo_uri"></a> [repo\_uri](#input\_repo\_uri) | URI of GitHub repo | `string` | `"https://github.com/GoogleCloudPlatform/cluster-toolkit"` | no |

@@ -15,6 +15,9 @@
 
 set -e
 
+export GHPC_MOCK_MACHINE_CONFIG='{"gpus": {}, "tpus": {}, "cpus": {}}'
+export GHPC_SKIP_BUCKET_CREATION="true"
+
 run_test() {
 	bp=$1
 	gc=$2
@@ -23,7 +26,7 @@ run_test() {
 	bpFile=$(basename "$bp")
 	DEPLOYMENT="golden_copy_deployment"
 	PROJECT="invalid-project"
-	VALIDATORS_TO_SKIP="test_project_exists,test_apis_enabled,test_region_exists,test_zone_exists,test_zone_in_region"
+	VALIDATORS_TO_SKIP="test_project_exists,test_apis_enabled,test_region_exists,test_zone_exists,test_zone_in_region,test_quota_availability,test_machine_type_in_zone,test_reservation_exists,test_disk_type_in_zone"
 	GHPC_PATH="${cwd}/ghpc"
 	# Cover the three possible starting sequences for local sources: ./ ../ /
 	LOCAL_SOURCE_PATTERN='source:\s\+\(\./\|\.\./\|/\)'
@@ -51,6 +54,7 @@ run_test() {
 	${GHPC_PATH} create -l ERROR \
 		--skip-validators="${VALIDATORS_TO_SKIP}" \
 		--vars="project_id=${PROJECT},deployment_name=${DEPLOYMENT}" \
+		--add-creator-label=false \
 		"${tmpdir}"/"${bpFile}" >/dev/null ||
 		{
 			echo "*** ERROR: error creating deployment with ghpc for ${bpFile}"
@@ -71,8 +75,13 @@ run_test() {
 	for folder in ./*; do
 		rm -rf "${folder}/modules"
 	done
+	rm -rf _modules
 	find . -name "README.md" -exec rm {} \;
 	sed -i -E 's/(ghpc_version: )(.*)/\1golden/' .ghpc/artifacts/expanded_blueprint.yaml
+	sed -i '/- validator: test_quota_availability/,+1d' .ghpc/artifacts/expanded_blueprint.yaml
+    sed -i '/- validator: test_machine_type_in_zone/,+1d' .ghpc/artifacts/expanded_blueprint.yaml
+    sed -i '/- validator: test_reservation_exists/,+1d' .ghpc/artifacts/expanded_blueprint.yaml
+    sed -i '/- validator: test_disk_type_in_zone/,+1d' .ghpc/artifacts/expanded_blueprint.yaml
 
 	# Compare the deployment folder with the golden copy
 	diff --recursive --color='auto' --exclude="previous_deployment_groups" \

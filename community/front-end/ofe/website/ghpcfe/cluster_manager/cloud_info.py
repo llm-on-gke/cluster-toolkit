@@ -49,7 +49,6 @@ gcp_machine_table = defaultdict(
         "t2d": defaultdict(lambda: "zen2"),  # TODO: Should also be zen3
         "h3": defaultdict(lambda: "sapphirerapids"),
         # Memory Optimized
-        "m2": defaultdict(lambda: "icelake"),
         "m2": defaultdict(lambda: "cascadelake"),
         "m1": defaultdict(
             lambda: "broadwell",
@@ -201,10 +200,6 @@ def _get_gcp_machine_types(
         "n2d-": [
             "pd-extreme", "hyperdisk-ml", "hyperdisk-balanced",
             "hyperdisk-extreme"
-        ],
-        "n1-": [
-            "pd-extreme", "hyperdisk-extreme", "hyperdisk-ml",
-            "hyperdisk-throughput", "hyperdisk-balanced"
         ],
         "t2d-": [
             "pd-extreme", "local-ssd", "hyperdisk-balanced",
@@ -427,6 +422,87 @@ def _get_gcp_subnets(credentials):
 def get_subnets(cloud_provider, credentials):
     if cloud_provider == "GCP":
         return _get_gcp_subnets(credentials)
+    else:
+        raise Exception("Unsupported Cloud Provider")
+
+
+def _get_gcp_subnet_egress_info(credentials, region, subnet_name):
+    """Report how a GCP subnet can reach Google APIs / the internet.
+
+    Cluster nodes have no external IP, so during bootstrap they depend on the
+    subnet having either Private Google Access (reaches Google APIs, including
+    the control bucket) or a Cloud NAT on its network (reaches package
+    mirrors). Returns a dict with keys ``found``, ``private_google_access``,
+    ``cloud_nat`` and ``network``. ``found`` is False (and the booleans left
+    False) when the subnet can't be read, so callers can fail open.
+    """
+    info = {
+        "found": False,
+        "private_google_access": False,
+        "cloud_nat": False,
+        "network": None,
+    }
+    (project, client) = _get_gcp_client(credentials)
+    try:
+        sn = (
+            client.subnetworks()
+            .get(project=project, region=region, subnetwork=subnet_name)
+            .execute()
+        )
+    except Exception as e:  # noqa: BLE001 - best-effort probe, fail open
+        logger.warning(
+            "Could not read subnet %s in %s: %s", subnet_name, region, e
+        )
+        return info
+
+    info["found"] = True
+    info["private_google_access"] = bool(sn.get("privateIpGoogleAccess", False))
+    info["network"] = sn.get("network")
+
+    # A Cloud NAT lives on a Cloud Router in the subnet's region. Treat the
+    # subnet as NAT-covered if a router on the same network has a NAT that
+    # either covers all subnets or names this subnet explicitly.
+    try:
+        routers = []
+        req = client.routers().list(project=project, region=region)
+        while req is not None:
+            resp = req.execute()
+            routers.extend(resp.get("items", []))
+            req = client.routers().list_next(
+                previous_request=req, previous_response=resp
+            )
+
+        subnet_network = (info["network"] or "").split("/")[-1]
+        for router in routers:
+            router_network = router.get("network", "").split("/")[-1]
+            if subnet_network and router_network != subnet_network:
+                continue
+            for nat in router.get("nats", []):
+                mode = nat.get("sourceSubnetworkIpRangesToNat", "")
+                if mode in (
+                    "ALL_SUBNETWORKS_ALL_IP_RANGES",
+                    "ALL_SUBNETWORKS_ALL_PRIMARY_IP_RANGES",
+                ):
+                    info["cloud_nat"] = True
+                    break
+                for nat_subnet in nat.get("subnetworks", []):
+                    name = nat_subnet.get("name", "")
+                    if name == subnet_name or name.endswith("/" + subnet_name):
+                        info["cloud_nat"] = True
+                        break
+                if info["cloud_nat"]:
+                    break
+            if info["cloud_nat"]:
+                break
+    except Exception as e:  # noqa: BLE001 - best-effort probe, fail open
+        logger.warning("Could not list Cloud Routers in %s: %s", region, e)
+
+    return info
+
+
+def get_subnet_egress_info(cloud_provider, credentials, region, subnet_name):
+    if cloud_provider == "GCP":
+        return _get_gcp_subnet_egress_info(credentials, region, subnet_name)
     else:
         raise Exception("Unsupported Cloud Provider")
 

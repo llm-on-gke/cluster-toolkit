@@ -25,12 +25,14 @@ module "kubectl_apply" {
   project_id = var.project_id
 
   apply_manifests = [{
+    name   = length("${var.slurm_cluster_name}-${var.nodeset_name}") <= 36 ? "nodeset-${var.slurm_cluster_name}-${var.nodeset_name}" : "nodeset-${substr("${var.slurm_cluster_name}-${var.nodeset_name}", 0, 30)}-${substr(sha1("${var.slurm_cluster_name}-${var.nodeset_name}"), 0, 5)}"
     source = local.manifest_path,
     template_vars = {
       slurm_namespace = var.slurm_namespace,
       nodeset_name    = "${var.slurm_cluster_name}-${var.nodeset_name}",
       nodeset_cr_name = "${var.slurm_cluster_name}-${var.nodeset_name}",
       controller_name = "${var.slurm_cluster_name}-controller",
+      controller_port = var.slurm_control_host_port,
       node_pool_name  = var.node_pool_names[0],
       node_count      = var.node_count_static,
       image           = var.image,

@@ -80,7 +80,7 @@ variable "enable_private_ipv6_google_access" {
 }
 
 variable "release_channel" {
-  description = "The release channel of this cluster. Accepted values are `UNSPECIFIED`, `RAPID`, `REGULAR` and `STABLE`."
+  description = "The release channel of this cluster. Accepted values are `UNSPECIFIED`, `RAPID`, `REGULAR`, `STABLE` and `EXTENDED`. Refer this documentation for more details: https://docs.cloud.google.com/kubernetes-engine/docs/concepts/release-channels#channels"
   type        = string
   default     = "UNSPECIFIED"
 }
@@ -92,27 +92,36 @@ variable "min_master_version" {
 }
 
 variable "version_prefix" {
-  description = "If provided, Terraform will only return versions that match the string prefix. For example, `1.31.` will match all `1.31` series releases. Since this is just a string match, it's recommended that you append a `.` after minor versions to ensure that prefixes such as `1.3` don't match versions like `1.30.1-gke.10` accidentally."
+  description = "If provided, Terraform will only return versions that match the string prefix. For example, `1.35.` will match all `1.35` series releases. Since this is just a string match, it's recommended that you append a `.` after minor versions to ensure that prefixes such as `1.3` don't match versions like `1.30.1-gke.10` accidentally."
   type        = string
-  default     = "1.31."
+  default     = "1.35."
 }
 
 variable "maintenance_start_time" {
-  description = "Start time for daily maintenance operations. Specified in GMT with `HH:MM` format."
+  description = "Start time for daily maintenance operations in GMT (HH:MM format). If set to null, a daily maintenance window restriction is not configured, meaning GKE can schedule maintenance at any time."
   type        = string
   default     = "09:00"
+  nullable    = true
 }
 
 variable "maintenance_exclusions" {
   description = "List of maintenance exclusions. A cluster can have up to three. For each exclusion, exactly one of `end_time` or `exclusion_end_time_behavior` must be specified. If `exclusion_end_time_behavior` is used, its value must be `UNTIL_END_OF_SUPPORT`."
   type = list(object({
     name                        = string
-    start_time                  = string
+    start_time                  = optional(string)
     end_time                    = optional(string)
     exclusion_scope             = string
     exclusion_end_time_behavior = optional(string)
   }))
   default = []
+  validation {
+    condition = alltrue([
+      for x in var.maintenance_exclusions : (
+        x.end_time == null || (x.start_time != null && try(length(trimspace(x.start_time)) > 0, false))
+      )
+    ])
+    error_message = "For fixed-window exclusions (where 'end_time' is specified), 'start_time' must also be provided and cannot be empty."
+  }
   validation {
     condition = alltrue([
       for x in var.maintenance_exclusions : (
@@ -191,12 +200,18 @@ variable "enable_gcsfuse_csi" {
   default     = false
 }
 
-
 variable "enable_persistent_disk_csi" {
   description = "The status of the Google Compute Engine Persistent Disk Container Storage Interface (CSI) driver addon, which allows the usage of a PD as volumes."
   type        = bool
   default     = true
 }
+
+variable "enable_multi_tier_checkpointing" {
+  description = "The status of the High Scale Checkpointing addon (Multi-Tier Checkpointing). This feature allows GKE to manage local SSD checkpoints and background uploads to Cloud Storage for highly resilient machine learning workloads."
+  type        = bool
+  default     = false
+}
+
 
 variable "enable_parallelstore_csi" {
   description = "The status of the Google Compute Engine Parallelstore Container Storage Interface (CSI) driver addon, which allows the usage of a parallelstore as volumes."
@@ -220,6 +235,24 @@ variable "enable_dcgm_monitoring" {
   description = "Enable GKE to collect DCGM metrics"
   type        = bool
   default     = true
+}
+
+variable "monitoring_components" {
+  description = "List of GKE monitoring components to enable. If empty, GKE monitoring is disabled."
+  type        = list(string)
+  nullable    = false
+  default = [
+    "SYSTEM_COMPONENTS",
+    "POD",
+    "DAEMONSET",
+    "DEPLOYMENT",
+    "STATEFULSET",
+    "STORAGE",
+    "HPA",
+    "CADVISOR",
+    "KUBELET",
+    "JOBSET"
+  ]
 }
 
 variable "enable_node_local_dns_cache" {
@@ -254,14 +287,14 @@ variable "system_node_pool_node_count" {
   })
   default = {
     total_min_nodes = 2
-    total_max_nodes = 10
+    total_max_nodes = 150
   }
 }
 
 variable "system_node_pool_machine_type" {
-  description = "Machine type for the system node pool."
+  description = "Machine type for the system node pool. Defaults to 'n2d-standard-4' if confidential nodes are enabled. Otherwise, it defaults to 'n4-standard-4' if available in the target region/zones, falling back to 'n2d-standard-4'."
   type        = string
-  default     = "e2-standard-4"
+  default     = null
 }
 
 variable "system_node_pool_disk_size_gb" {
@@ -352,6 +385,13 @@ variable "master_authorized_networks" {
     display_name = string
   }))
   default = []
+
+  validation {
+    condition     = var.master_authorized_networks == null ? true : can([for net in var.master_authorized_networks : cidrhost(net.cidr_block, 0)])
+    error_message = "Validation failed due to invalid CIDR IP address in 'master_authorized_networks.cidr_block'. All values must be in CIDR format (e.g. 1.2.3.4/32)."
+  }
+
+
 }
 
 variable "service_account_email" {
@@ -361,7 +401,7 @@ variable "service_account_email" {
 }
 
 variable "service_account_scopes" {
-  description = "Scopes to to use with the system node pool."
+  description = "Scopes to use with the system node pool."
   type        = set(string)
   default     = ["https://www.googleapis.com/auth/cloud-platform"]
 }
@@ -376,6 +416,12 @@ variable "k8s_service_account_name" {
   description = "Kubernetes service account name to use with the gke cluster"
   type        = string
   default     = "workload-identity-k8s-sa"
+}
+
+variable "namespace" {
+  description = "Kubernetes service account namespace to use with the gke cluster"
+  type        = string
+  default     = "default"
 }
 
 variable "autoscaling_profile" {
@@ -562,8 +608,27 @@ variable "enable_inference_gateway" {
   default     = false
 }
 
+variable "auto_monitoring_scope" {
+  description = <<-EOT
+  Scope of auto monitoring for Managed Prometheus. Valid values are 'ALL' or 'NONE'. Defaults to 'NONE'.
+  For more information see https://docs.cloud.google.com/kubernetes-engine/docs/how-to/configure-automatic-application-monitoring
+  EOT
+  type        = string
+  default     = "NONE"
+  validation {
+    condition     = contains(["ALL", "NONE"], var.auto_monitoring_scope)
+    error_message = "auto_monitoring_scope can only be ALL or NONE."
+  }
+}
+
 variable "enable_pathways_for_tpus" {
   description = "If true, conditionally deploys a dedicated CPU node pool (cpu-np) using n4-standard-64 instances."
+  type        = bool
+  default     = false
+}
+
+variable "enable_vertical_pod_autoscaling" {
+  description = "Enable vertical pod autoscaling for the cluster."
   type        = bool
   default     = false
 }
@@ -572,4 +637,105 @@ variable "enable_slice_controller" {
   description = "Enables the GKE Slice Controller for Super-slicing topologies."
   type        = bool
   default     = false
+}
+
+variable "cluster_autoscaling" {
+  description = <<EOT
+  GKE Node Auto-Provisioning (NAP) and Cluster Autoscaling configuration.
+
+  enabled:               Enable/disable GKE Cluster autoscaling and auto-provisioning.
+  service_account_email: The service account tied to node-provisioning. Defaults to the deployment service account.
+  oauth_scopes:          Scopes assigned to nodes provisioned by NAP.
+  autoprovisioning_disk_size_gb: The disk size of auto-provisioned nodes (GB). Default 100.
+  autoprovisioning_disk_type:    The disk type of auto-provisioned nodes. Default pd-balanced.
+  autoprovisioning_cpu_max:      The maximum number of CPU cores limit. Default 1,000,000.
+  autoprovisioning_memory_max:   The maximum Memory limit in GB. Default 10,000,000.
+  limits:                Explicit upper bounds to apply during scaling.
+    autoprovisioning_machine_type: GCE machine type tier (used as input).
+    autoprovisioning_resource_type: The underlying specific GKE accelerator resource name (inferred by expansion).
+    autoprovisioning_max_count:    The ceiling for specific accelerator types. Default 1000.
+
+  Note: `autoprovisioning_machine_type` is consumed dynamically by the toolkit pipeline to resolve 
+  the precise `autoprovisioning_resource_type` (e.g. `nvidia-h100-80gb`) expected by Terraform.
+
+  WARNING: Enabling autoscaling defaults to effectively unlimited scaling (1,000,000 CPU cores and 10,000,000 GB of memory) unless specific limits are passed in. This may result in large unexpected billing charges if a workload misconfiguration occurs.
+  EOT
+  type = object({
+    limits = list(object({
+      autoprovisioning_machine_type  = optional(string)
+      autoprovisioning_resource_type = optional(string)
+      autoprovisioning_max_count     = optional(number, 1000)
+    }))
+    service_account_email         = optional(string, "")
+    oauth_scopes                  = optional(list(string), ["https://www.googleapis.com/auth/cloud-platform"])
+    autoprovisioning_disk_size_gb = optional(number, 100)
+    autoprovisioning_disk_type    = optional(string, "pd-balanced")
+    autoprovisioning_auto_upgrade = optional(bool, true)
+    autoprovisioning_auto_repair  = optional(bool, true)
+    autoprovisioning_cpu_max      = optional(number, 1000000)
+    autoprovisioning_memory_max   = optional(number, 10000000)
+  })
+  default = null
+  validation {
+    condition     = var.cluster_autoscaling == null ? true : contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced"], coalesce(var.cluster_autoscaling.autoprovisioning_disk_type, "pd-balanced"))
+    error_message = "autoprovisioning_disk_type must be one of pd-standard, pd-balanced, pd-ssd, hyperdisk-balanced."
+  }
+  validation {
+    condition     = var.cluster_autoscaling == null ? true : coalesce(var.cluster_autoscaling.autoprovisioning_disk_size_gb, 100) >= 10
+    error_message = "autoprovisioning_disk_size_gb must be at least 10 GB."
+  }
+}
+
+variable "machine_mappings_json" {
+  description = "Injected JSON string containing machine mappings"
+  type        = string
+  default     = "{}"
+}
+
+variable "enable_ml_diagnostics" {
+  description = "Enables ML Diagnostics on the GKE cluster."
+  type        = bool
+  default     = false
+}
+
+variable "network_policy" {
+  description = "Configuration for the network policy addon. Enabling network policy for clusters with GKE Dataplane V2 (ADVANCED_DATAPATH) is not supported; GKE Dataplane V2 automatically manages network policy enforcement."
+  type = object({
+    enabled  = bool
+    provider = optional(string, "PROVIDER_UNSPECIFIED")
+  })
+  default = {
+    enabled  = false
+    provider = "PROVIDER_UNSPECIFIED"
+  }
+}
+
+variable "enable_fqdn_network_policy" {
+  description = "Enable FQDN Network Policy on the cluster. This feature requires GKE Dataplane V2 to be enabled."
+  type        = bool
+  default     = false
+}
+
+variable "enable_confidential_nodes" {
+  description = "Enable Confidential Nodes at the cluster level. All nodes in the cluster will run on Confidential VMs."
+  type        = bool
+  default     = false
+}
+
+variable "confidential_instance_type" {
+  description = "The type of technology used by the confidential nodes (e.g., SEV, SEV_SNP, TDX). Leave null for default."
+  type        = string
+  default     = null
+}
+
+variable "enable_confidential_storage" {
+  description = "Enable Confidential Storage on the cluster nodes. Node boot disks will be encrypted using keys protected by the Confidential VM."
+  type        = bool
+  default     = false
+}
+
+variable "boot_disk_kms_key" {
+  description = "The Customer Managed Encryption Key (CMEK) used to encrypt the boot disks of the GKE nodes. Required if enable_confidential_storage is true."
+  type        = string
+  default     = null
 }

@@ -18,12 +18,17 @@ package dependencies
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/hashicorp/go-version"
 )
+
+const docLink = "https://cloud.google.com/cluster-toolkit/docs/setup/install-dependencies"
 
 type DownloadDecision int
 
@@ -55,29 +60,90 @@ func PatchPath() error {
 	}
 
 	currentPath := os.Getenv("PATH")
-	newPath := currentPath + string(os.PathListSeparator) + tfCacheDir + string(os.PathListSeparator) + packerCacheDir
+	newPath := tfCacheDir + string(os.PathListSeparator) + packerCacheDir + string(os.PathListSeparator) + currentPath
 	os.Setenv("PATH", newPath)
 
 	return nil
 }
 
-// EnsureDependencies checks if terraform and packer are accessible in the PATH.
+// HasBinary checks if a binary is available in the PATH.
+func HasBinary(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
+// EnsureDependencies checks if requested tools are accessible in the PATH.
 // If not, it handles downloading them according to the decision.
-func EnsureDependencies(decision DownloadDecision) error {
-	if err := ensureBinary("terraform", TerraformVersion, decision); err != nil {
-		return err
+// It returns an error if no tools are specified.
+func EnsureDependencies(decision DownloadDecision, tools ...string) error {
+	if len(tools) == 0 {
+		return fmt.Errorf("no tools specified for dependency check")
 	}
-	if err := ensureBinary("packer", PackerVersion, decision); err != nil {
-		return err
+
+	for _, tool := range tools {
+		if tool != "terraform" && tool != "packer" {
+			return fmt.Errorf("unknown tool requested: %s", tool)
+		}
+	}
+
+	seen := make(map[string]bool)
+	for _, tool := range tools {
+		if seen[tool] {
+			continue
+		}
+		seen[tool] = true
+
+		var err error
+		switch tool {
+		case "terraform":
+			err = ensureBinary("terraform", TerraformVersion, decision)
+		case "packer":
+			err = ensureBinary("packer", PackerVersion, decision)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func ensureBinary(binaryName, version string, decision DownloadDecision) error {
-	if _, err := exec.LookPath(binaryName); err == nil {
-		return nil
+	path, err := exec.LookPath(binaryName)
+	if err != nil {
+		return downloadFlow(binaryName, version, decision)
 	}
 
+	if binaryName != "terraform" {
+		return nil // for packer, just check existence for now
+	}
+
+	installedVersion, err := getInstalledTfVersion(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Could not determine installed terraform version: %v. Proceeding to download recommended version %s. See: %s\n", err, version, docLink)
+		return downloadFlow(binaryName, version, decision)
+	}
+
+	cmp, err := compareVersions(installedVersion, version)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Could not parse installed terraform version %q: %v. Proceeding to download recommended version %s. See: %s\n", installedVersion, err, version, docLink)
+		return downloadFlow(binaryName, version, decision)
+	}
+
+	switch {
+	case cmp == 0:
+		return nil // exact match, use installed version
+	case cmp > 0:
+		// installed version is newer
+		fmt.Fprintf(os.Stderr, "Warning: Terraform version %s is currently installed. We recommend using version %s for compatibility with all features. See: %s\n", installedVersion, version, docLink)
+		return nil // proceed with newer version
+	default:
+		// installed version is older (cmp < 0)
+		fmt.Fprintf(os.Stderr, "Installed terraform version %s is older than required version %s. For version requirements and installation instructions, please see: %s\n", installedVersion, version, docLink)
+		return downloadFlow(binaryName, version, decision)
+	}
+}
+
+func downloadFlow(binaryName, version string, decision DownloadDecision) error {
 	if err := confirmDownload(binaryName, version, decision); err != nil {
 		return err
 	}
@@ -90,18 +156,53 @@ func ensureBinary(binaryName, version string, decision DownloadDecision) error {
 	return downloadAndExtract(binaryName, version, binaryCacheDir)
 }
 
+func getInstalledTfVersion(path string) (string, error) {
+	cmd := exec.Command(path, "version", "--json")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	var version struct {
+		TerraformVersion string `json:"terraform_version"`
+	}
+	if err := json.Unmarshal(out, &version); err != nil {
+		return "", err
+	}
+
+	return version.TerraformVersion, nil
+}
+
+// compareVersions returns:
+//
+//	-1 if v1 < v2
+//	 0 if v1 == v2
+//	 1 if v1 > v2
+func compareVersions(v1, v2 string) (int, error) {
+	ver1, err := version.NewVersion(v1)
+	if err != nil {
+		return 0, fmt.Errorf("invalid version format %q: %w", v1, err)
+	}
+	ver2, err := version.NewVersion(v2)
+	if err != nil {
+		return 0, fmt.Errorf("invalid version format %q: %w", v2, err)
+	}
+
+	return ver1.Compare(ver2), nil
+}
+
 func confirmDownload(binaryName, version string, decision DownloadDecision) error {
 	if decision == DownloadDecisionNo {
-		return fmt.Errorf("%s is missing. Download is explicitly disabled. Enable download by specifying --download-dependencies flag.", binaryName)
+		return fmt.Errorf("%s is missing or incompatible; download is explicitly disabled, enable download by specifying --download-dependencies flag (see %s)", binaryName, docLink)
 	}
 
 	if decision == DownloadDecisionAsk {
-		fmt.Printf("%s v%s is missing. Do you want to download it? [y/N]: ", binaryName, version)
+		fmt.Fprintf(os.Stderr, "%s v%s is missing or incompatible. Do you want to download it? [y/N]: ", binaryName, version)
 		reader := bufio.NewReader(os.Stdin)
 		response, _ := reader.ReadString('\n')
 		response = strings.TrimSpace(strings.ToLower(response))
 		if response != "y" && response != "yes" {
-			return fmt.Errorf("user declined to download %s", binaryName)
+			return fmt.Errorf("user declined to download %s; see %s", binaryName, docLink)
 		}
 	}
 

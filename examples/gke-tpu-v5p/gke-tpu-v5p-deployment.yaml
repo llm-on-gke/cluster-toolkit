@@ -1,0 +1,84 @@
+# Copyright 2026 "Google LLC"
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+terraform_backend_defaults:
+  type: gcs
+  configuration:
+    bucket:
+
+vars:
+  # Your GCP Project ID
+  project_id:
+
+  # This should be unique across all of your Cluster
+  # Toolkit Deployments.
+  deployment_name:
+
+  # The GCP Region used for this deployment.
+  # example: us-west4
+  region:
+
+  # The GCP Zone used for this deployment.
+  # example: us-west4-a
+  zone:
+
+  # The number of TPU slices to create
+  num_slices: 1
+
+  # Machine type
+  # TPU v5p options: ct5p-hightpu-4t
+  machine_type:
+
+  # The TPU placement topology for pod slice node pool.
+  # ct5p-hightpu-4t is exactly 4 chips (2x2x1 topology) or scales with slice size (e.g. 2x2x2 for 8 chips).
+  tpu_topology:
+
+  # Cidr block containing the IP of the machine calling terraform.
+  # To allow all (IAM restrictions still enforced), use 0.0.0.0/0
+  # To allow only your IP address, use <YOUR-IP-ADDRESS>/32
+  authorized_cidr:
+
+  # The namespace to be configured for running workloads
+  user_namespace: default
+
+## Choose ONE consumption model from the options below (default is Specific Reservation):
+
+## --- Option 1: Specific Reservation ---
+## See for more information: https://github.com/GoogleCloudPlatform/cluster-toolkit/tree/main/modules/compute/gke-node-pool#using-gce-reservations
+  reservation_affinity:
+    consume_reservation_type: SPECIFIC_RESERVATION
+    specific_reservations:
+    - name:
+
+## --- Option 2: DWS Flex Start ---
+  ## For TPUs, max node count should be num of chips based on topology divided by num chips for the machine type (e.g. 4 for ct5p-hightpu-4t, so a 2x2x2 topology is 8 chips / 4 = 2 nodes).
+  ## Reference: https://cloud.google.com/tpu/docs/v5p
+  #enable_flex_start: true
+  #autoscaling_min_node_count: 0
+  #autoscaling_max_node_count: 2
+
+## --- Option 3: DWS Flex Start + Queued Provisioning ---
+  ## Requires a multi-host TPU slice
+  ## Change this variable if you want to have a custom kueue config file
+  #kueue_configuration_path: $(ghpc_stage("../dws-sample-workloads/tpu-dws-queues.yaml.tftpl"))
+  #enable_flex_start: true
+  #enable_queued_provisioning: true
+  #autoscaling_min_node_count: 0
+  #autoscaling_max_node_count: 2
+
+## --- Option 4: Spot ---
+  #spot: true
+
+## --- Option 5: On-Demand ---
+  ## No variables needed; comment out Option 1 and leave the rest commented.

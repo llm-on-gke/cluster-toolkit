@@ -4,8 +4,8 @@
   * [Instance Image](#instance-images)
   * [Pinning Specific Images](#pinning-specifics-images)
 * [Cluster Toolkit Supported Images](#cluster-toolkit-supported-images)
-  * [HPC Rocky Linux 8](#hpc-rocky-linux-8)
-  * [Debian 11](#debian-11)
+  * [HPC Rocky Linux 9](#hpc-rocky-linux-9)
+  * [Debian 12](#debian-12)
   * [Ubuntu 22.04 LTS](#ubuntu-2204-lts)
   * [Windows](#windows)
   * [Other Images](#other-images)
@@ -27,7 +27,7 @@ Please see the [blueprint catalog](https://cloud.google.com/hpc-toolkit/docs/set
 > modules that have their own image specification. Please read the
 > documentation for any module utilized.
 
-When an Cluster Toolkit blueprint points to a predefined source module (e.g.
+When a Cluster Toolkit blueprint points to a predefined source module (e.g.
 `community/modules/compute/schedmd-slurm-gcp-v6-nodeset`), generally the
 module has a default image defined. In order to override this default image, a
 user may specify the `instance_image` setting in the yaml blueprint, within
@@ -36,9 +36,9 @@ either the specific module definition or the global variables. The
 
 ```yaml
 instance_image:
- family: hpc-rocky-linux-8
+ family: hpc-rocky-linux-9
  project: cloud-hpc-image-public    # If family is defined, omit name
- name: hpc-rocky-linux-8-v20251117  # If name is defined, omit family
+ name: hpc-rocky-linux-9-v20260101  # If name is defined, omit family
 ```
 
 The `project` setting defines the space where the image will be found. Either
@@ -67,11 +67,11 @@ blueprint:
     settings:
 
       instance_image:
-        family: hpc-rocky-linux-8
+        family: hpc-rocky-linux-9
         project: cloud-hpc-image-public
 
       instance_image:
-        family: debian-11
+        family: debian-12
         project: debian-cloud
 
       instance_image:
@@ -97,7 +97,7 @@ gcloud compute images create <new_image_name> --project=<your project> --source-
 
 Alternatively, a user can specify a family of images you wish to pull from (i.e.
 `--source-image-family` instead of `--source-image`). See more on
-[gcloud compute images create](gcloud-compute-images).
+[gcloud compute images create][gcloud-compute-images].
 
 Once the image has been created or copied, the user can specify their own
 project and the new image name in the `instance_image` field discussed in
@@ -105,13 +105,13 @@ project and the new image name in the `instance_image` field discussed in
 
 ## Cluster Toolkit Supported Images
 
-### HPC Rocky Linux 8
+### HPC Rocky Linux 9
 
-HPC Rocky Linux 8 is the primary supported VM image for HPC workloads on Google Cloud.
+HPC Rocky Linux 9 is the primary supported VM image for HPC workloads on Google Cloud.
 
-### Debian 11
+### Debian 12
 
-The Cluster Toolkit officially supports Debian 11 based VM images in the majority of
+The Cluster Toolkit officially supports Debian 12 based VM images in the majority of
 our modules, with a couple of exceptions.
 
 ### Ubuntu 22.04 LTS
@@ -131,7 +131,7 @@ description of our support for Windows images.
   <th>Deployment Type/Scheduler</th>
   <th>Feature</th>
   <th></th>
-  <th>Debian 11</th><th>Rocky Linux 8</th><th>Ubuntu 22.04</th>
+  <th>Debian 11</th><th>Rocky Linux 9</th><th>Ubuntu 22.04</th>
 </tr>
 <tr>
   <td></td><td></td><td></td><td></td><td></td><td></td>

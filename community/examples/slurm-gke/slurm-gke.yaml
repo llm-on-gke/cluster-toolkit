@@ -108,7 +108,7 @@ deployment_groups:
     settings:
       initial_node_count: 1
       disk_type: pd-balanced
-      machine_type: e2-standard-4
+      machine_type: n2d-standard-4
       zones: [$(vars.zone)]
 
   - id: gke_compute_pool
@@ -126,7 +126,8 @@ deployment_groups:
     use: [gke_cluster]
     settings:
       apply_manifests:
-      - source: $(ghpc_stage("./files/slurm-namespace.yaml.tftpl"))
+      - name: slurm-namespace
+        source: $(ghpc_stage("./files/slurm-namespace.yaml.tftpl"))
         template_vars:
           namespace: $(vars.slurm_namespace)
 
@@ -139,6 +140,7 @@ deployment_groups:
       slurm_operator_namespace: $(vars.slurm_namespace)
       install_slurm_operator_chart: true
       install_slurm_chart: false
+    outputs: [instructions]
 
   - id: gke_compute_nodeset
     source: community/modules/compute/gke-nodeset
@@ -187,6 +189,5 @@ deployment_groups:
     - homefs
     settings:
       slurm_cluster_name: $(vars.deployment_name)
-      enable_slurm_auth: true
       cgroup_conf_tpl: $(ghpc_stage("./files/cgroup.conf.tpl"))
       enable_controller_public_ips: true

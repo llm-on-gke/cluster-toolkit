@@ -1,0 +1,73 @@
+/**
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+*/
+
+
+
+resource "google_project_service" "dns_api" {
+  project            = var.project_id
+  service            = "dns.googleapis.com"
+  disable_on_destroy = false
+}
+
+locals {
+  # This label allows for billing report tracking based on module.
+  labels = merge(var.labels, { ghpc_module = "dns-managed-zone", ghpc_role = "network" })
+}
+
+locals {
+  private_network_urls = distinct(compact(concat(
+    var.network_ids,
+    var.network_id != null ? [var.network_id] : [],
+  )))
+}
+
+resource "google_dns_managed_zone" "zone" {
+  project     = google_project_service.dns_api.project
+  name        = var.zone_name
+  dns_name    = var.dns_name
+  description = var.description
+  labels      = local.labels
+  visibility  = var.visibility
+
+  dynamic "private_visibility_config" {
+    for_each = var.visibility == "private" ? [1] : []
+    content {
+      dynamic "networks" {
+        for_each = local.private_network_urls
+        content {
+          network_url = networks.value
+        }
+      }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.visibility != "private" || length(local.private_network_urls) > 0
+      error_message = "Private zones require at least one network. Set network_id or network_ids."
+    }
+  }
+}
+
+resource "google_dns_record_set" "record" {
+  for_each     = { for rs in var.recordsets : "${rs.name}-${rs.type}" => rs }
+  project      = google_project_service.dns_api.project
+  managed_zone = google_dns_managed_zone.zone.name
+  name         = (each.value.name == "" || each.value.name == "@") ? google_dns_managed_zone.zone.dns_name : (endswith(each.value.name, ".") ? each.value.name : "${each.value.name}.${google_dns_managed_zone.zone.dns_name}")
+  type         = each.value.type
+  ttl          = each.value.ttl
+  rrdatas      = each.value.rrdatas
+}

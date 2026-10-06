@@ -48,10 +48,11 @@ sed -i -e 's/SELINUX=enforcing/SELINUX=permissive/g' /etc/selinux/config
 printf "####################\n#### Installing required packages\n####################\n"
 dnf install -y epel-release
 dnf update -y --security
+dnf update -y expat
 dnf config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo
 
 dnf install -y terraform
-dnf install --best -y google-cloud-sdk nano make gcc python3.12-devel unzip git \
+dnf install --best -y google-cloud-cli nano make gcc python3.12-devel unzip git \
 	rsync wget nginx bind-utils policycoreutils-python-utils \
 	packer supervisor python3-certbot-nginx jq
 curl --silent --show-error --location https://github.com/mikefarah/yq/releases/download/v4.13.4/yq_linux_amd64 --output /usr/local/bin/yq
@@ -109,17 +110,14 @@ install_sqlite
 
 python3.12 -m ensurepip --upgrade
 
-pip3.12 install google-api-python-client \
-	google-cloud-secret-manager \
-	google.cloud.pubsub \
-	pyyaml addict httplib2
+pip3.12 install --require-hashes -r "$(dirname "$0")/requirements.txt"
 
 # Set Python3.12 as default Python3
 echo '2' | update-alternatives --config python3
 # Download configuration file
 #
-gsutil cp "gs://${config_bucket}/webserver/config" /tmp/config
-gsutil rm "gs://${config_bucket}/webserver/config"
+gcloud storage cp "gs://${config_bucket}/webserver/config" /tmp/config
+gcloud storage rm "gs://${config_bucket}/webserver/config"
 
 # Load configurations
 #
@@ -173,7 +171,7 @@ if [ "${deploy_mode}" == "git" ]; then
 
 elif [ "${deploy_mode}" == "tarball" ]; then
 	printf "\n####################\n#### Download web application files\n####################\n"
-	gsutil cp "gs://${config_bucket}/webserver/deployment.tar.gz" /tmp/deployment.tar.gz
+	gcloud storage cp "gs://${config_bucket}/webserver/deployment.tar.gz" /tmp/deployment.tar.gz
 
 	fetch_hpc_toolkit="tar xfz /tmp/deployment.tar.gz"
 fi
@@ -224,10 +222,10 @@ sudo su - gcluster -c /bin/bash <<EOF
   printf "\nEstablishing django environment..."
   python3.12 -m venv /opt/gcluster/django-env
   source /opt/gcluster/django-env/bin/activate
-  printf "\nUpgrading pip...\n"
-  pip install --upgrade pip
+  printf "\nInstalling pip...\n"
+  pip install --require-hashes -r /opt/gcluster/cluster-toolkit/community/front-end/ofe/infrastructure_files/gcs_bucket/webserver/django_requirements.txt
   printf "\nInstalling pip requirements...\n"
-  pip install -r /opt/gcluster/cluster-toolkit/community/front-end/ofe/requirements.txt
+  pip install --require-hashes -r /opt/gcluster/cluster-toolkit/community/front-end/ofe/requirements.txt
 
   printf "Generating configuration file for backend..."
   echo "config:" > configuration.yaml

@@ -1,0 +1,809 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package gke
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hpc-toolkit/pkg/config"
+	"hpc-toolkit/pkg/logging"
+	"hpc-toolkit/pkg/orchestrator"
+	"hpc-toolkit/pkg/shell"
+	"path"
+	"strconv"
+	"strings"
+)
+
+type MachineTypeCap struct {
+	Accelerators []struct {
+		Count int    `json:"guestAcceleratorCount"`
+		Type  string `json:"guestAcceleratorType"`
+	} `json:"accelerators"`
+	GuestCpus int `json:"guestCpus"`
+	MemoryMb  int `json:"memoryMb"`
+}
+
+func (g *GKEOrchestrator) FetchMachineCapacity(machineType, zone string) (int, error) {
+	cap, err := g.FetchMachineCapabilities(machineType, zone)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(cap.Accelerators) > 0 {
+		return cap.Accelerators[0].Count, nil
+	}
+	if cap.GuestCpus > 0 {
+		return cap.GuestCpus, nil
+	}
+	return 0, fmt.Errorf("no accelerators or guestCpus found for machine type %s in zone %s", machineType, zone)
+}
+
+// getZonesForMachineType finds all candidate zones hosting the specified machineType in the cluster's node pools.
+func (g *GKEOrchestrator) getZonesForMachineType(machineType string) []string {
+	seen := make(map[string]struct{})
+	for _, np := range g.clusterDesc.NodePools {
+		// Filter node pools that match the target machine type.
+		if np.Config.MachineType != machineType {
+			continue
+		}
+		// If the node pool doesn't define custom locations, it inherits cluster-wide locations.
+		locs := np.Locations
+		if len(locs) == 0 {
+			locs = g.clusterZones
+		}
+		for _, loc := range locs {
+			seen[loc] = struct{}{}
+		}
+	}
+
+	// Return a deduplicated slice of all matched zones.
+	var zones []string
+	for loc := range seen {
+		zones = append(zones, loc)
+	}
+	return zones
+}
+
+func (g *GKEOrchestrator) FetchMachineCapabilities(machineType, zone string) (MachineTypeCap, error) {
+
+	cacheKey := machineType + ":" + zone
+	if g.machineCapCache != nil {
+		if cap, ok := g.machineCapCache[cacheKey]; ok {
+			return cap, nil
+		}
+	}
+
+	isRegion := len(strings.Split(zone, "-")) < 3
+	zonesToTry := []string{zone}
+
+	if isRegion {
+		npZones := g.getZonesForMachineType(machineType)
+		if len(npZones) > 0 {
+			zonesToTry = npZones
+		} else {
+			if !g.clusterDesc.Autoscaling.EnableNodeAutoprovisioning {
+				return MachineTypeCap{}, fmt.Errorf("failed to fetch machine capabilities for %s: no node pool matching machine type found and GKE Node Auto-Provisioning is disabled", machineType)
+			}
+			if len(g.clusterZones) > 0 {
+				zonesToTry = g.clusterZones
+			}
+		}
+	}
+
+	var lastErr error
+	for _, z := range zonesToTry {
+
+		mt, err := g.machineTypeClient.GetMachineType(g.projectID, z, machineType)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		logging.Info("Discovered machine capabilities in zone %s", z)
+
+		cap := MachineTypeCap{
+			GuestCpus: int(mt.GuestCpus),
+			MemoryMb:  int(mt.MemoryMb),
+		}
+
+		count, accelType, isTPU := config.ResolveAcceleratorInfo(mt, machineType)
+		if count > 0 {
+			// Fetch correct accelerator type for TPUs using map
+			if isTPU {
+				accelType = g.GenerateGKENodeSelectorLabel(machineType)
+			}
+			cap.Accelerators = append(cap.Accelerators, struct {
+				Count int    `json:"guestAcceleratorCount"`
+				Type  string `json:"guestAcceleratorType"`
+			}{Count: count, Type: accelType})
+		}
+
+		if g.machineCapCache == nil {
+			g.machineCapCache = make(map[string]MachineTypeCap)
+		}
+		g.machineCapCache[cacheKey] = cap
+		// Also cache for the specific zone that succeeded
+		specificKey := machineType + ":" + z
+		g.machineCapCache[specificKey] = cap
+		return cap, nil
+	}
+
+	if isRegion {
+		return MachineTypeCap{}, fmt.Errorf("failed to fetch machine capabilities for %s: tried in all candidate zones %v but did not find machine type in any of them", machineType, zonesToTry)
+	}
+	return MachineTypeCap{}, fmt.Errorf("failed to fetch machine capabilities for %s in zone %s: %w", machineType, zone, lastErr)
+}
+
+func (g *GKEOrchestrator) verifyDynamicSlicingActive(opts ManifestOptions) (bool, error) {
+	// Return false immediately if not using TPUs.
+	if !config.IsTPU(opts.ComputeType) {
+		return false, nil
+	}
+
+	if g.dynamicSlicingCache == nil {
+		g.dynamicSlicingCache = make(map[string]bool)
+	}
+
+	cacheKey := opts.ComputeType + ":" + opts.Topology
+	if val, ok := g.dynamicSlicingCache[cacheKey]; ok {
+		return val, nil
+	}
+
+	// Check discovered node pools for dynamic-slicing
+	requestedMachineName := opts.MachineType
+	if requestedMachineName == "" {
+		var err error
+		requestedMachineName, err = g.resolveMachineName(opts.ComputeType)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	isTPU7x := strings.Contains(strings.ToLower(requestedMachineName), "tpu7x")
+	if !isTPU7x || !g.hasSlicingTopologies() || !g.hasSliceAdmissionCheck() {
+		g.dynamicSlicingCache[cacheKey] = false
+		return false, nil
+	}
+
+	active, err := g.checkNodePoolsDynamicSlicing(requestedMachineName, opts)
+	if err != nil {
+		return active, err
+	}
+	g.dynamicSlicingCache[cacheKey] = active
+	return active, nil
+}
+
+func (g *GKEOrchestrator) verifyStaticSlicingActive(machineType, topology string) (bool, error) {
+	if !config.IsTPU(machineType) {
+		return false, nil
+	}
+
+	// Static sub-slicing (logical partitioning) is strictly unsupported for 3D Torus TPUs (v4 and v5p)
+	if config.Is3DTorusTPU(machineType) {
+		return false, nil
+	}
+
+	if g.staticSlicingCache == nil {
+		g.staticSlicingCache = make(map[string]bool)
+	}
+
+	cacheKey := fmt.Sprintf("%s-%s", machineType, topology)
+	if val, ok := g.staticSlicingCache[cacheKey]; ok {
+		return val, nil
+	}
+
+	if !g.hasSlicingTopologies() {
+		g.staticSlicingCache[cacheKey] = false
+		return false, nil
+	}
+
+	accelLabel := g.GenerateGKENodeSelectorLabel(machineType)
+	output, err := g.queryDiscoveredTopologies(accelLabel, machineType)
+	if err != nil {
+		return false, fmt.Errorf("failed to discover topologies for static sub-slicing check: %w", err)
+	}
+	discoveredTopologies := g.parseTopologies(output)
+
+	for t := range discoveredTopologies {
+		fits, err := config.CheckTopologyContainment(topology, t, machineType)
+		if err != nil {
+			return false, err
+		}
+		if fits {
+			logging.Info("Static sub-slicing/TAS active: requested topology %s fits inside discovered physical topology %s.", topology, t)
+			g.staticSlicingCache[cacheKey] = true
+			return true, nil
+		}
+	}
+
+	g.staticSlicingCache[cacheKey] = false
+	return false, nil
+}
+
+func (g *GKEOrchestrator) checkNodePoolsDynamicSlicing(requestedMachineName string, opts ManifestOptions) (bool, error) {
+	projID := opts.ProjectID
+	if projID == "" {
+		projID = g.projectID
+	}
+
+	for _, np := range g.clusterDesc.NodePools {
+		if !strings.EqualFold(np.Config.MachineType, requestedMachineName) || np.PlacementPolicy == nil {
+			continue
+		}
+
+		mode := np.PlacementPolicy.AcceleratorTopologyMode
+		if mode == "" && np.PlacementPolicy.PolicyName != "" {
+			policy, err := g.describeResourcePolicyCached(np.PlacementPolicy.PolicyName, opts.ClusterLocation, projID)
+			if err != nil {
+				if errors.Is(err, ErrResourcePolicyPermissionDenied) {
+					logging.Warn("Permission denied querying resource policy %q for node pool %q: %v. Assuming non-dynamic slicing.", np.PlacementPolicy.PolicyName, np.Name, err)
+				} else {
+					return false, fmt.Errorf("failed to fetch compute resource policy %q for node pool %q: %w", np.PlacementPolicy.PolicyName, np.Name, err)
+				}
+			} else if policy != nil {
+				mode = policy.AcceleratorTopologyMode
+			}
+		}
+
+		if strings.EqualFold(mode, "PROVISION_ONLY") {
+			if err := validateTPU7xTopology(opts.Topology, requestedMachineName); err != nil {
+				return true, err
+			}
+			logging.Info("Dynamic-slicing PROVISION_ONLY mode validated for TPU7x node pool %s with topology %s.", np.Name, opts.Topology)
+			return true, nil
+		}
+	}
+
+	logging.Info("Node pool does not have dynamic topology subset requirement. Dynamic-slicing not active.")
+	return false, nil
+}
+
+func (g *GKEOrchestrator) checkDynamicSlicingViaGKE() bool {
+	for _, np := range g.clusterDesc.NodePools {
+		if np.PlacementPolicy != nil {
+			mode := np.PlacementPolicy.AcceleratorTopologyMode
+			if strings.EqualFold(mode, "PROVISION_ONLY") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ErrResourcePolicyPermissionDenied indicates the caller lacks GCP IAM permissions to read the compute resource policy.
+var ErrResourcePolicyPermissionDenied = errors.New("permission denied querying compute resource policy")
+
+// describeResourcePolicyCached retrieves GCE resource policy metadata using gcloud compute resource-policies describe,
+// utilizing a local cache to prevent redundant invocations across dynamic slicing and NAP policy resolution.
+func (g *GKEOrchestrator) describeResourcePolicyCached(policyName, location, projectID string) (*GCEWorkloadPolicy, error) {
+	if g.resourcePolicyCache == nil {
+		g.resourcePolicyCache = make(map[string]*GCEWorkloadPolicy)
+	}
+
+	shortPolicyName := path.Base(policyName)
+	if policy, found := g.resourcePolicyCache[shortPolicyName]; found {
+		return policy, nil
+	}
+
+	region := shell.ExtractRegion(location)
+	res := g.executor.ExecuteCommand("gcloud", "compute", "resource-policies", "describe", shortPolicyName, "--region="+region, "--project="+projectID, "--format=json")
+	if res.ExitCode != 0 {
+		stderrLower := strings.ToLower(res.Stderr)
+		if strings.Contains(stderrLower, "not found") || strings.Contains(stderrLower, "404") {
+			return nil, nil // Policy does not exist
+		}
+		if isPermissionDenied(res.Stderr) {
+			return nil, fmt.Errorf("%w: %s", ErrResourcePolicyPermissionDenied, res.Stderr)
+		}
+		return nil, fmt.Errorf("gcloud compute resource-policies describe failed: %s\n"+
+			"To resolve this issue:\n"+
+			"  1. Check IAM: Ensure your GCP credentials have 'compute.resourcePolicies.get' permission (e.g., 'roles/compute.viewer').\n"+
+			"  2. Verify Policy: Test manual access by running:\n"+
+			"     gcloud compute resource-policies describe %s --region=%s --project=%s",
+			res.Stderr, shortPolicyName, region, projectID)
+	}
+
+	var raw gceResourcePolicyRaw
+	if err := json.Unmarshal([]byte(res.Stdout), &raw); err != nil {
+		return nil, fmt.Errorf("failed to parse resource policy json: %w", err)
+	}
+
+	policy := &GCEWorkloadPolicy{
+		Name:                    raw.Name,
+		Region:                  raw.Region,
+		AcceleratorTopology:     raw.WorkloadPolicy.AcceleratorTopology,
+		AcceleratorTopologyMode: raw.WorkloadPolicy.AcceleratorTopologyMode,
+		Type:                    raw.WorkloadPolicy.Type,
+	}
+	g.resourcePolicyCache[shortPolicyName] = policy
+	return policy, nil
+}
+
+func validateTPU7xTopology(topology string, machineType string) error {
+	if topology == "" {
+		return fmt.Errorf("topology must be specified explicitly via --topology flag for TPU 7x dynamic slicing")
+	}
+	if !config.TopologyRegex.MatchString(topology) {
+		return fmt.Errorf("invalid topology format %s", topology)
+	}
+	return config.Validate3DTopology(topology, machineType, true)
+}
+
+func (g *GKEOrchestrator) hasSliceAdmissionCheck() bool {
+	acResult := g.executor.ExecuteCommand("kubectl", "get", "admissioncheck", "-o", "json")
+	if acResult.ExitCode != 0 {
+		logging.Warn("Failed to query AdmissionChecks. Assuming dynamic-slicing not active.")
+		return false
+	}
+
+	var acList struct {
+		Items []struct {
+			Spec struct {
+				ControllerName string `json:"controllerName"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+
+	if err := json.Unmarshal([]byte(acResult.Stdout), &acList); err != nil {
+		logging.Warn("Failed to parse AdmissionChecks JSON: %v. Assuming dynamic-slicing not active.", err)
+		return false
+	}
+
+	for _, item := range acList.Items {
+		if item.Spec.ControllerName == "accelerator.gke.io/slice" {
+			return true
+		}
+	}
+
+	logging.Info("No AdmissionCheck with controller 'accelerator.gke.io/slice' found. Dynamic-slicing not active.")
+	return false
+}
+
+func (g *GKEOrchestrator) hasSlicingTopologies() bool {
+	if g.slicingTopologiesChecked {
+		return g.slicingTopologiesDetected
+	}
+
+	defer func() {
+		g.slicingTopologiesChecked = true
+	}()
+
+	tResult := g.executor.ExecuteCommand("kubectl", "get", "topologies.kueue.x-k8s.io", "-o", "json")
+	if tResult.ExitCode != 0 {
+		logging.Warn("Failed to query Kueue topologies. Assuming dynamic-slicing not active.")
+		return false
+	}
+
+	var tList struct {
+		Items []struct {
+			Spec struct {
+				Levels []struct {
+					NodeLabel string `json:"nodeLabel"`
+				} `json:"levels"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+
+	if err := json.Unmarshal([]byte(tResult.Stdout), &tList); err != nil {
+		logging.Warn("Failed to parse Kueue topologies JSON: %v. Assuming dynamic-slicing not active.", err)
+		return false
+	}
+
+	if len(tList.Items) == 0 {
+		logging.Info("No Kueue topology resources found. Dynamic-slicing not active.")
+		return false
+	}
+
+	for _, t := range tList.Items {
+		for _, l := range t.Spec.Levels {
+			if (strings.HasPrefix(l.NodeLabel, "cloud.google.com/gke-tpu-slice-") || strings.HasPrefix(l.NodeLabel, "cloud.google.com/gke-tpu-partition-")) && strings.HasSuffix(l.NodeLabel, "-id") {
+				g.slicingTopologiesDetected = true
+				return true
+			}
+		}
+	}
+
+	logging.Info("Kueue topologies found but they do not contain slice/partition labels. Assuming dynamic-slicing not active.")
+	return false
+}
+
+func (g *GKEOrchestrator) calculateResourceLimits(opts ManifestOptions, profile JobProfile) (cpu, mem, gpu, tpu string, err error) {
+	if profile.IsCPUMachine {
+		logging.Info("Using cached capacity for CPU machine %s during limits calculation: %d", opts.ComputeType, profile.CapacityCount)
+		offsetVCPUs := max(1, int(float64(profile.CapacityCount)*0.95))
+		return fmt.Sprintf("%d", offsetVCPUs), "", "", "", nil
+	}
+
+	mapped := g.GenerateGKENodeSelectorLabel(opts.ComputeType)
+
+	cpuLim, memLim, gpuLim, tpuLim, err := g.calculateGCPMachineResourceLimits(opts, mapped)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("cluster resolution failed for %s: %w", opts.ComputeType, err)
+	}
+	if opts.ParallelContainers > 1 && tpuLim != "" {
+		tpuInt, err := strconv.Atoi(tpuLim)
+		if err != nil {
+			return "", "", "", "", fmt.Errorf("failed to parse tpu limit %q: %w", tpuLim, err)
+		}
+		tpuLim = strconv.Itoa(tpuInt / opts.ParallelContainers)
+	}
+	return cpuLim, memLim, gpuLim, tpuLim, nil
+}
+
+func (g *GKEOrchestrator) calculateGCPMachineResourceLimits(opts ManifestOptions, mapped string) (cpu, mem, gpu, tpu string, err error) {
+	machineName := opts.MachineType
+
+	count, err := g.FetchMachineCapacity(machineName, opts.ClusterLocation)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("failed to resolve machine type %s: %w", machineName, err)
+	}
+
+	if count > 0 {
+		logging.Info("Dynamically determined capacity for %s: %d", machineName, count)
+
+		if strings.Contains(strings.ToLower(mapped), "nvidia") {
+			return "", "", fmt.Sprintf("%d", count), "", nil
+		}
+		if strings.Contains(strings.ToLower(mapped), "tpu") {
+			return "", "", "", fmt.Sprintf("%d", count), nil
+		}
+		return "", "", "", "", fmt.Errorf("machine type %s resolved to %d capacity but could not be classified as GPU or TPU (mapped label: %s)", machineName, count, mapped)
+	}
+	return "", "", "", "", fmt.Errorf("failed to determine capacity for machine type %s", machineName)
+}
+
+func (g *GKEOrchestrator) resolveMachineName(acceleratorType string) (string, error) {
+	// Check if shorthand (key) existis in the static mao
+	if fullType, exists := config.AcceleratorShorthandMap[strings.ToLower(acceleratorType)]; exists {
+		return fullType, nil
+	}
+	// Check if the passed value is a full machine type (value) in the static map
+	for _, v := range config.AcceleratorShorthandMap {
+		if strings.EqualFold(v, acceleratorType) {
+			return acceleratorType, nil
+		}
+	}
+
+	// Check cluster state [Dynamic accelerator to machine type mapping from the cluster]
+	if g.acceleratorToMachineType != nil {
+		if machineType, exists := g.acceleratorToMachineType[strings.ToLower(acceleratorType)]; exists {
+			return machineType, nil
+		}
+	}
+
+	// Check if the input is a full machine type and present in the cluster (required for CPUs).
+	clusterMachineTypes, err := g.queryAllMachineTypes()
+	if err == nil {
+		for _, cmt := range clusterMachineTypes {
+			if strings.EqualFold(acceleratorType, cmt) {
+				return acceleratorType, nil
+			}
+		}
+	}
+
+	// 3. Fail fast
+	return "", fmt.Errorf("machine type %q could not be resolved from static maps or cluster state", acceleratorType)
+}
+
+func (g *GKEOrchestrator) resolveJobMachineType(computeType string) (string, error) {
+	parts := strings.Split(computeType, "-")
+	machineName, err := g.resolveMachineName(computeType)
+	if err == nil {
+		return machineName, nil
+	}
+
+	prefix := parts[0]
+	candidates := config.GetCandidatesForShorthand(prefix)
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("compute type %q is not a known shorthand and could not be resolved", prefix)
+	}
+
+	machineName, err = g.resolveAmbiguousComputeShorthand(prefix, candidates)
+	if err != nil {
+		return "", err
+	}
+	return machineName, nil
+}
+
+func (g *GKEOrchestrator) resolveTPURequirements(job *orchestrator.JobDefinition) (isDynamicSlicing bool, isStaticSlicing bool, err error) {
+	isTPU7x := strings.Contains(strings.ToLower(job.MachineType), "tpu7x")
+	if isTPU7x && job.Topology == "" {
+		return false, false, fmt.Errorf("topology must be specified explicitly via --topology flag for TPU 7x machine type %s", job.MachineType)
+	}
+
+	// Validate topology shape before resolving/discovering
+	if job.Topology != "" {
+		if err := config.ValidateHardwareRequest(job.MachineType, job.Topology); err != nil {
+			return false, false, err
+		}
+	}
+
+	var topology string
+	topology, isDynamicSlicing, err = g.resolveTopology(job)
+	if err != nil {
+		return false, false, err
+	}
+	job.Topology = topology
+
+	if !isDynamicSlicing && job.Topology != "" {
+		isStaticSlicing, err = g.verifyStaticSlicingActive(job.MachineType, job.Topology)
+		if err != nil {
+			return false, false, err
+		}
+	}
+
+	if err = g.dynamicallyCalculateNodesPerSlice(job); err != nil {
+		return false, false, err
+	}
+
+	if err = g.resolveTPUPlacementPolicy(job, isTPU7x, isDynamicSlicing); err != nil {
+		return false, false, err
+	}
+
+	return isDynamicSlicing, isStaticSlicing, nil
+}
+
+func (g *GKEOrchestrator) resolveTPUPlacementPolicy(job *orchestrator.JobDefinition, isTPU7x, isDynamicSlicing bool) error {
+	if job.PlacementPolicy != "" {
+		return g.resolveWorkloadPlacementPolicy(job, isTPU7x, isDynamicSlicing)
+	}
+	if isTPU7x && !isDynamicSlicing && job.NodesPerSlice > 1 {
+		policy, err := g.resolveTPUWorkloadPolicy(job.MachineType, job.Topology, job.ClusterLocation, job.ProjectID, job.DryRunManifest != "")
+		if err != nil {
+			return err
+		}
+		job.PlacementPolicy = policy
+	}
+	return nil
+}
+
+// parseResourcePolicyURI parses a GCE resource policy URI, URL, or plain name into its components.
+// E.g.:
+// - "my-policy" -> Name: "my-policy"
+// - "projects/my-proj/regions/us-central1/resourcePolicies/my-policy" -> Project: "my-proj", Region: "us-central1", Name: "my-policy"
+// - "https://www.googleapis.com/compute/v1/projects/my-proj/regions/us-central1/resourcePolicies/my-policy" -> Project: "my-proj", Region: "us-central1", Name: "my-policy"
+func parseResourcePolicyURI(policyStr string) parsedResourcePolicy {
+	policyStr = strings.TrimSuffix(strings.TrimSpace(policyStr), "/")
+	if !strings.Contains(policyStr, "/") {
+		return parsedResourcePolicy{Name: policyStr}
+	}
+
+	return parsedResourcePolicy{
+		Project: extractURIPart(policyStr, "projects"),
+		Region:  extractURIPart(policyStr, "regions"),
+		Name:    extractURIPart(policyStr, "resourcepolicies"),
+	}
+}
+
+// resolveWorkloadPlacementPolicy sanitizes user-specified placement policy URIs into bare resource names
+// and validates their existence, project/region locality, topology, and static mode for TPU 7x workloads.
+func (g *GKEOrchestrator) resolveWorkloadPlacementPolicy(job *orchestrator.JobDefinition, isTPU7x, isDynamicSlicing bool) error {
+	if job.PlacementPolicy == "" {
+		return nil
+	}
+
+	parsed := parseResourcePolicyURI(job.PlacementPolicy)
+	if parsed.Name == "" {
+		return fmt.Errorf("invalid placement policy %q: unable to determine policy name", job.PlacementPolicy)
+	}
+	job.PlacementPolicy = parsed.Name
+
+	if err := validateResourcePolicyLocality(parsed, job.ProjectID, job.ClusterLocation); err != nil {
+		return err
+	}
+
+	// GCE Workload Resource Policies are only queried and validated for static multi-host TPU 7x workloads.
+	// For GPUs/CPUs, GKE NAP dynamically creates compact placement groups on the fly.
+	if isTPU7x && !isDynamicSlicing && job.NodesPerSlice > 1 && job.DryRunManifest == "" {
+		clusterRegion := shell.ExtractRegion(job.ClusterLocation)
+		return g.validateTPU7xPlacementPolicy(parsed.Name, clusterRegion, job.ProjectID, job.Topology)
+	}
+
+	return nil
+}
+
+func validateResourcePolicyLocality(parsed parsedResourcePolicy, projectID, clusterLocation string) error {
+	if parsed.Project != "" && projectID != "" && !strings.EqualFold(parsed.Project, projectID) {
+		return fmt.Errorf("placement policy %q belongs to project %q, but cluster is in project %q", parsed.Name, parsed.Project, projectID)
+	}
+	clusterRegion := shell.ExtractRegion(clusterLocation)
+	if parsed.Region != "" && clusterRegion != "" && !strings.EqualFold(parsed.Region, clusterRegion) {
+		return fmt.Errorf("placement policy %q belongs to region %q, but cluster is in region %q", parsed.Name, parsed.Region, clusterRegion)
+	}
+	return nil
+}
+
+func (g *GKEOrchestrator) validateTPU7xPlacementPolicy(name, region, projectID, expectedTopology string) error {
+	policy, err := g.describeResourcePolicyCached(name, region, projectID)
+	if err != nil {
+		if errors.Is(err, ErrResourcePolicyPermissionDenied) {
+			logging.Warn("Permission denied querying placement policy %q: %v. Proceeding without policy validation.", name, err)
+			return nil
+		}
+		return fmt.Errorf("failed to describe placement policy %q: %w", name, err)
+	}
+	if policy == nil {
+		return fmt.Errorf("placement policy %q does not exist in region %s (project %s)", name, region, projectID)
+	}
+	if policy.Type != "" && !strings.EqualFold(policy.Type, "HIGH_THROUGHPUT") {
+		return fmt.Errorf("placement policy %q has type %q; expected %q", name, policy.Type, "HIGH_THROUGHPUT")
+	}
+	if !isStaticWorkloadPolicyMode(policy.AcceleratorTopologyMode) {
+		return fmt.Errorf("placement policy %q has mode %q, which is incompatible with static multi-host TPU workloads (expected AUTO_CONNECT or default static placement)", name, policy.AcceleratorTopologyMode)
+	}
+	if expectedTopology != "" && policy.AcceleratorTopology != "" && !strings.EqualFold(policy.AcceleratorTopology, expectedTopology) {
+		return fmt.Errorf("placement policy %q has topology %q; expected %q", name, policy.AcceleratorTopology, expectedTopology)
+	}
+	return nil
+}
+
+func (g *GKEOrchestrator) resolveHardwareRequirements(job *orchestrator.JobDefinition) (profile JobProfile, isDynamicSlicing bool, isStaticSlicing bool, err error) {
+	if job.ComputeType == "" {
+		return JobProfile{}, false, false, nil
+	}
+
+	machineName, err := g.resolveJobMachineType(job.ComputeType)
+	if err != nil {
+		return JobProfile{}, false, false, err
+	}
+	job.MachineType = machineName
+	if config.IsTPU(machineName) {
+		isDynamicSlicing, isStaticSlicing, err = g.resolveTPURequirements(job)
+		if err != nil {
+			return JobProfile{}, false, false, err
+		}
+		if job.GKENAPProvisioning != "" {
+			if isDynamicSlicing {
+				return JobProfile{}, false, false, fmt.Errorf("TPU Dynamic Slicing is not supported on GKE Node Auto-Provisioning (NAP) workloads")
+			}
+			if isStaticSlicing {
+				return JobProfile{}, false, false, fmt.Errorf("TPU Static Sub-slicing is not supported on GKE Node Auto-Provisioning (NAP) workloads")
+			}
+			if job.GKEScheduler == "gke.io/tpu-provisioning-request" {
+				return JobProfile{}, false, false, fmt.Errorf("TPU ProvisioningRequest (DWS Flex) is not supported on GKE Node Auto-Provisioning (NAP) workloads")
+			}
+		}
+	} else {
+		// For non-TPU workloads (GPU/CPU), validate placement policy if specified.
+		if err := g.resolveWorkloadPlacementPolicy(job, false, false); err != nil {
+			return JobProfile{}, isDynamicSlicing, isStaticSlicing, err
+		}
+	}
+	isCPUMachine, capacity, err := g.determineIfCPUMachine(job)
+	if err != nil {
+		return JobProfile{}, isDynamicSlicing, isStaticSlicing, err
+	}
+
+	if err := g.validateConsumptionForStaticCluster(job); err != nil {
+		return JobProfile{}, isDynamicSlicing, isStaticSlicing, err
+	}
+
+	return JobProfile{
+		IsCPUMachine:  isCPUMachine,
+		CapacityCount: capacity,
+	}, isDynamicSlicing, isStaticSlicing, nil
+}
+
+func (g *GKEOrchestrator) resolveAmbiguousComputeShorthand(prefix string, candidates []string) (string, error) {
+	logging.Info("Detected ambiguous compute shorthand %q, finding candidates...", prefix)
+
+	clusterMachineTypes, err := g.queryAllMachineTypes()
+	if err != nil {
+		return "", err
+	}
+
+	cmtSet := make(map[string]bool, len(clusterMachineTypes))
+	for _, cmt := range clusterMachineTypes {
+		cmtSet[cmt] = true
+	}
+
+	var matchedCandidates []string
+	for _, c := range candidates {
+		if cmtSet[c] {
+			matchedCandidates = append(matchedCandidates, c)
+		}
+	}
+
+	if len(matchedCandidates) == 1 {
+		logging.Info("Disambiguated %q to %q based on cluster state.", prefix, matchedCandidates[0])
+		return matchedCandidates[0], nil
+	}
+
+	if len(matchedCandidates) == 0 {
+		return "", fmt.Errorf("no matching machine types found in cluster for shorthand %q. Available candidates: %v", prefix, candidates)
+	}
+
+	return "", fmt.Errorf("multiple matching machine types found in cluster for shorthand %q: %v. Please pass the required machine type directly to disambiguate.", prefix, matchedCandidates)
+}
+
+func (g *GKEOrchestrator) dynamicallyCalculateNodesPerSlice(job *orchestrator.JobDefinition) error {
+	if !config.IsTPU(job.MachineType) {
+		if job.NodesPerSlice <= 0 {
+			job.NodesPerSlice = 1 // default to 1 for non-TPU jobs if not provided
+		}
+		return nil
+	}
+	if job.Topology == "" {
+		return fmt.Errorf("could not resolve TPU topology for the provided machine type: %q", job.MachineType)
+	}
+	machineType := job.MachineType
+	accelsPerVM, err := g.FetchMachineCapacity(machineType, job.ClusterLocation)
+	if err != nil {
+		logging.Warn("Failed to fetch machine capacity for %s: %v. Falling back to static defaults.", machineType, err)
+		accelsPerVM = 0 // Fallback to static logic in CalculateAcceleratorNodes
+	}
+	nodes, err := config.CalculateAcceleratorNodes(machineType, job.Topology, accelsPerVM)
+	if err != nil {
+		return fmt.Errorf("failed to calculate nodes from topology: %w", err)
+	}
+	job.NodesPerSlice = nodes
+	if job.NodesPerSlice <= 0 {
+		return fmt.Errorf("invalid nodes_per_slice (%d) for topology %s", job.NodesPerSlice, job.Topology)
+	}
+	logging.Info("Dynamically determined nodes_per_slice for %s: %d", job.Topology, job.NodesPerSlice)
+	return nil
+}
+
+func (g *GKEOrchestrator) fetchClusterState(job *orchestrator.JobDefinition) error {
+	logging.Info("Eagerly fetching and caching machine capabilities...")
+	machineTypes, err := g.queryAllMachineTypes()
+	if err != nil {
+		return err
+	}
+
+	for _, mt := range machineTypes {
+		_, err := g.FetchMachineCapabilities(mt, job.ClusterLocation)
+		if err != nil {
+			logging.Warn("Failed to pre-fetch capabilities for machine type %s: %v", mt, err)
+		}
+	}
+	return nil
+}
+
+func (g *GKEOrchestrator) resolveResourcesAndGates(opts *ManifestOptions, isCPUMachine bool, capacity int, job orchestrator.JobDefinition) (JobProfile, error) {
+	isGPU := !isCPUMachine && !config.IsTPU(job.MachineType)
+	if isGPU && job.GKEScheduler == "gke.io/topology-aware-auto" {
+		opts.SchedulingGates = indentYaml("schedulingGates:\n  - name: \"gke.io/topology-aware-auto-"+job.WorkloadName+"\"", 14)
+		opts.SchedulerName = ""
+	}
+
+	profile := JobProfile{
+		IsCPUMachine:  isCPUMachine,
+		CapacityCount: capacity,
+	}
+
+	opts.ParallelContainers = 1
+	if job.UseParallelContainers && !job.IsPathwaysJob && strings.Contains(job.MachineType, "tpu7x") {
+		opts.ParallelContainers = 2
+	}
+
+	cpuLimit, memoryLimit, gpuLimit, tpuLimit, err := g.calculateResourceLimits(*opts, profile)
+	if err != nil {
+		logging.Warn("Warning: failed to calculate resource limits: %v", err)
+	} else {
+		if opts.ComputeType != "" && gpuLimit == "" && tpuLimit == "" {
+			logging.Info("Suppressing nodeSelector label for deduced CPU machine %s", opts.ComputeType)
+			opts.ComputeType = ""
+		}
+		resStr, err := g.buildResourcesString(cpuLimit, memoryLimit, gpuLimit, tpuLimit, 16)
+		if err != nil {
+			return profile, err
+		}
+		opts.ResourcesString = resStr
+	}
+
+	return profile, nil
+}

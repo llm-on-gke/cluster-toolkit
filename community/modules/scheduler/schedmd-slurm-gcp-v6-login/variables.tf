@@ -59,6 +59,12 @@ variable "disk_type" {
   default     = "pd-ssd"
 }
 
+variable "disk_storage_pool" {
+  description = "Storage pool to use for the boot disk. Note that storage pools are only supported with Hyperdisk types. For boot disks, only hyperdisk-balanced is supported. You must provide an existing storage pool, as this module does not create new ones."
+  type        = string
+  default     = null
+}
+
 variable "disk_size_gb" {
   type        = number
   description = "Boot disk size in GB."
@@ -108,6 +114,7 @@ variable "additional_disks" {
     device_name                         = optional(string)
     disk_size_gb                        = optional(number)
     disk_type                           = optional(string)
+    disk_storage_pool                   = optional(string)
     disk_labels                         = optional(map(string))
     auto_delete                         = optional(bool)
     boot                                = optional(bool)
@@ -120,7 +127,7 @@ variable "additional_disks" {
 }
 
 variable "additional_networks" {
-  description = "Additional network interface details for GCE, if any."
+  description = "Additional network interface details for GCE, if any. For Private Service Connect interfaces, 'network_attachment' must be the full resource URI: projects/{project}/regions/{region}/networkAttachments/{name}."
   default     = []
   type = list(object({
     access_config = optional(list(object({
@@ -135,6 +142,7 @@ variable "additional_networks" {
       network_tier = string
     })), [])
     network            = optional(string)
+    network_attachment = optional(string)
     network_ip         = optional(string, "")
     nic_type           = optional(string)
     queue_count        = optional(number)
@@ -143,6 +151,32 @@ variable "additional_networks" {
     subnetwork_project = optional(string)
   }))
   nullable = false
+  validation {
+    condition = alltrue([
+      for nic in var.additional_networks : (
+        # Cannot specify network or subnetwork alongside network_attachment
+        !(((nic.network != null && nic.network != "") || (nic.subnetwork != null && nic.subnetwork != "")) && (nic.network_attachment != null && nic.network_attachment != "")) &&
+        # Cannot specify subnetwork_project, access_config, ipv6_access_config, or alias_ip_range alongside network_attachment
+        (nic.network_attachment == null || nic.network_attachment == "" || (
+          (nic.subnetwork_project == null || nic.subnetwork_project == "") &&
+          length(try(nic.access_config, [])) == 0 &&
+          length(try(nic.ipv6_access_config, [])) == 0 &&
+          length(try(nic.alias_ip_range, [])) == 0
+        )) &&
+        # Must specify at least one of network, subnetwork, or network_attachment
+        ((nic.network != null && nic.network != "") || (nic.subnetwork != null && nic.subnetwork != "") || (nic.network_attachment != null && nic.network_attachment != ""))
+      )
+    ])
+    error_message = "In var.additional_networks, you must specify at least one of 'network', 'subnetwork', or 'network_attachment'. When 'network_attachment' is set, you cannot specify 'network', 'subnetwork', 'subnetwork_project', 'access_config', 'ipv6_access_config', or 'alias_ip_range'."
+  }
+  validation {
+    condition = alltrue([
+      for nic in var.additional_networks : (
+        nic.network_attachment == null || nic.network_attachment == "" || can(regex("^(?:https://www.googleapis.com/compute/[^/]+/)?projects/[^/]+/regions/[^/]+/networkAttachments/[^/]+$", nic.network_attachment))
+      )
+    ])
+    error_message = "In var.additional_networks, 'network_attachment' must be the full resource URI: projects/{project}/regions/{region}/networkAttachments/{name}."
+  }
 }
 
 variable "advanced_machine_features" {
@@ -378,7 +412,7 @@ variable "instance_image" {
     EOD
   type        = map(string)
   default = {
-    family  = "slurm-gcp-6-12-hpc-rocky-linux-8"
+    family  = "slurm-gcp-6-12-hpc-rocky-linux-9"
     project = "schedmd-slurm-public"
   }
 
@@ -429,4 +463,10 @@ variable "tags" {
 variable "subnetwork_self_link" {
   type        = string
   description = "Subnet to deploy to."
+}
+
+variable "startup_script" {
+  description = "Startup script used by the login VMs."
+  type        = string
+  default     = "# no-op"
 }

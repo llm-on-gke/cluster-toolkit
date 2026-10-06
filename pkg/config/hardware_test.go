@@ -15,6 +15,8 @@
 package config
 
 import (
+	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/zclconf/go-cty/cty"
@@ -64,13 +66,6 @@ func TestCalculateAcceleratorNodes(t *testing.T) {
 			expectErr:     false,
 		},
 		{
-			name:          "v7x 1 chip per VM test",
-			machineType:   "tpu7x-standard-1t",
-			topology:      "1x1x1",
-			expectedNodes: 1, // 1 / 1
-			expectErr:     false,
-		},
-		{
 			name:          "v7x 4 chip per VM test",
 			machineType:   "tpu7x-standard-4t",
 			topology:      "4x4x4",
@@ -95,7 +90,7 @@ func TestCalculateAcceleratorNodes(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			nodes, err := calculateAcceleratorNodes(tc.machineType, tc.topology)
+			nodes, err := CalculateAcceleratorNodes(tc.machineType, tc.topology, 0)
 			if tc.expectErr {
 				if err == nil {
 					t.Fatalf("expected error but got nil")
@@ -112,57 +107,114 @@ func TestCalculateAcceleratorNodes(t *testing.T) {
 	}
 }
 
+func TestCalculateAcceleratorNodes_WithExplicitCount(t *testing.T) {
+	nodes, err := CalculateAcceleratorNodes("ct5p-hightpu-4t", "4x4x4", 8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nodes != 8 {
+		t.Errorf("expected 8 nodes, got %d", nodes)
+	}
+}
+
 func TestExtractTopology(t *testing.T) {
 	bp := Blueprint{}
 
 	mod1 := &Module{
 		Settings: Dict{}.With("tpu_topology", cty.StringVal("4x4x4")),
 	}
-	if topo, ok := extractTopology(bp, mod1); !ok || topo != "4x4x4" {
+	if topo, ok := ExtractTopology(bp, mod1); !ok || topo != "4x4x4" {
 		t.Errorf("expected 4x4x4, got %v (ok=%v)", topo, ok)
 	}
 
-	pp := cty.ObjectVal(map[string]cty.Value{"tpu_topology": cty.StringVal("2x2x2")})
+	// Test placement_policy with 3D topology
+	pp3D := cty.ObjectVal(map[string]cty.Value{"tpu_topology": cty.StringVal("2x2x2")})
 	mod2 := &Module{
-		Settings: Dict{}.With("placement_policy", pp),
+		Settings: Dict{}.With("placement_policy", pp3D),
 	}
-	if topo, ok := extractTopology(bp, mod2); !ok || topo != "2x2x2" {
+	if topo, ok := ExtractTopology(bp, mod2); !ok || topo != "2x2x2" {
 		t.Errorf("expected 2x2x2, got %v (ok=%v)", topo, ok)
+	}
+
+	// Test placement_policy with 2D topology
+	pp2D := cty.ObjectVal(map[string]cty.Value{"tpu_topology": cty.StringVal("4x4")})
+	mod4 := &Module{
+		Settings: Dict{}.With("placement_policy", pp2D),
+	}
+	if topo, ok := ExtractTopology(bp, mod4); !ok || topo != "4x4" {
+		t.Errorf("expected 4x4 from placement_policy, got %v (ok=%v)", topo, ok)
 	}
 
 	mod3 := &Module{
 		Settings: Dict{},
 	}
-	if topo, ok := extractTopology(bp, mod3); ok {
+	if topo, ok := ExtractTopology(bp, mod3); ok {
 		t.Errorf("expected false, got %v", topo)
 	}
 }
 
-func TestInjectCompactPlacementPolicy(t *testing.T) {
-	mod1 := &Module{
+func TestExtractTopologyFromWorkloadPolicy(t *testing.T) {
+	// Test check used modules for workload_policy (2D topology)
+	wpMod2D := Module{
+		ID:       "wp2d",
+		Settings: Dict{}.With("workload_policy", cty.ObjectVal(map[string]cty.Value{"accelerator_topology": cty.StringVal("4x4")})),
+	}
+	bpTest2D := Blueprint{
+		Groups: []Group{
+			{
+				Modules: []Module{wpMod2D},
+			},
+		},
+	}
+	modUse2D := &Module{
+		Use:      []ModuleID{"wp2d"},
 		Settings: Dict{},
 	}
-	injectCompactPlacementPolicy(mod1, "4x4x4")
-	if !mod1.Settings.Has("placement_policy") {
-		t.Fatal("expected placement_policy to be injected")
-	}
-	pp1 := mod1.Settings.Get("placement_policy").AsValueMap()
-	if pp1["type"].AsString() != "COMPACT" {
-		t.Errorf("expected pp type COMPACT, got %v", pp1["type"])
-	}
-	if pp1["tpu_topology"].AsString() != "4x4x4" {
-		t.Errorf("expected pp topology 4x4x4, got %v", pp1["tpu_topology"])
+	if topo, ok := extractTopologyFromWorkloadPolicy(bpTest2D, modUse2D); !ok || topo != "4x4" {
+		t.Errorf("expected 4x4 from workload_policy, got %v (ok=%v)", topo, ok)
 	}
 
-	ppOrig := cty.ObjectVal(map[string]cty.Value{"foo": cty.StringVal("bar")})
-	mod2 := &Module{
-		Settings: Dict{}.With("placement_policy", ppOrig),
+	// Test check used modules for workload_policy (3D topology)
+	wpMod3D := Module{
+		ID:       "wp3d",
+		Settings: Dict{}.With("workload_policy", cty.ObjectVal(map[string]cty.Value{"accelerator_topology": cty.StringVal("2x2x1")})),
 	}
-	injectCompactPlacementPolicy(mod2, "2x2x2")
-	pp2 := mod2.Settings.Get("placement_policy").AsValueMap()
-	if pp2["type"].AsString() != "COMPACT" || pp2["tpu_topology"].AsString() != "2x2x2" || pp2["foo"].AsString() != "bar" {
-		t.Errorf("mod2 placement policy incorrect: %v", pp2)
+	bpTest := Blueprint{
+		Groups: []Group{
+			{
+				Modules: []Module{wpMod3D},
+			},
+		},
 	}
+
+	modUse3D := &Module{
+		Use:      []ModuleID{"wp3d"},
+		Settings: Dict{},
+	}
+	if topo, ok := extractTopologyFromWorkloadPolicy(bpTest, modUse3D); !ok || topo != "2x2x1" {
+		t.Errorf("expected 2x2x1 from workload_policy, got %v (ok=%v)", topo, ok)
+	}
+
+	// Test check used modules for workload_policy without topology
+	wpModNoTopo := Module{
+		ID:       "wp_no_topo",
+		Settings: Dict{}.With("workload_policy", cty.ObjectVal(map[string]cty.Value{"type": cty.StringVal("HIGH_THROUGHPUT")})),
+	}
+	bpTestNoTopo := Blueprint{
+		Groups: []Group{
+			{
+				Modules: []Module{wpModNoTopo},
+			},
+		},
+	}
+	modUseNoTopo := &Module{
+		Use:      []ModuleID{"wp_no_topo"},
+		Settings: Dict{},
+	}
+	if topo, ok := extractTopologyFromWorkloadPolicy(bpTestNoTopo, modUseNoTopo); ok {
+		t.Errorf("expected false when workload_policy lacks topology, got %v", topo)
+	}
+
 }
 
 func TestExpandHardwareSettings(t *testing.T) {
@@ -210,7 +262,403 @@ func TestExpandHardwareSettings(t *testing.T) {
 	if count3 != 16 {
 		t.Errorf("expected static_node_count 16, got %d", count3)
 	}
-	if !mod3.Settings.Has("placement_policy") {
-		t.Errorf("expected placement_policy to be injected for multi-node setups")
+
+	// Test that it skips non-TPU machine types
+	mod4 := &Module{
+		Settings: Dict{}.
+			With("machine_type", cty.StringVal("n2-standard-2")).
+			With("tpu_topology", cty.StringVal("2x2")),
+	}
+	err = expandHardwareSettings(bp, mod4)
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if mod4.Settings.Has("static_node_count") {
+		t.Errorf("expected static_node_count NOT to be set for non-TPU machine type")
+	}
+
+	// Test that it skips Flex Start pools
+	mod5 := &Module{
+		Settings: Dict{}.
+			With("machine_type", cty.StringVal("ct6e-standard-4t")).
+			With("tpu_topology", cty.StringVal("2x2")).
+			With("enable_flex_start", cty.BoolVal(true)),
+	}
+	err = expandHardwareSettings(bp, mod5)
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if mod5.Settings.Has("static_node_count") {
+		t.Errorf("expected static_node_count NOT to be set when enable_flex_start is true")
+	}
+}
+
+func TestResolveTopologyForChips(t *testing.T) {
+	tests := []struct {
+		name       string
+		prefix     string
+		totalChips int
+		wantShape  string
+		wantErr    bool
+	}{
+		{
+			name:       "v4 8 cores (4 chips)",
+			prefix:     "v4",
+			totalChips: 8,
+			wantShape:  "2x2x1",
+			wantErr:    false,
+		},
+		{
+			name:       "v4 16 cores (8 chips)",
+			prefix:     "v4",
+			totalChips: 16,
+			wantShape:  "2x2x2",
+			wantErr:    false,
+		},
+		{
+			name:       "v5p 8 cores (4 chips)",
+			prefix:     "v5p",
+			totalChips: 8,
+			wantShape:  "2x2x1",
+			wantErr:    false,
+		},
+		{
+			name:       "v5p 16 cores (8 chips)",
+			prefix:     "v5p",
+			totalChips: 16,
+			wantShape:  "2x2x2",
+			wantErr:    false,
+		},
+		{
+			name:       "tpu7x 2048 chips",
+			prefix:     "tpu7x",
+			totalChips: 2048,
+			wantShape:  "",
+			wantErr:    true,
+		},
+		{
+			name:       "v6e 1 chip",
+			prefix:     "v6e",
+			totalChips: 1,
+			wantShape:  "1x1",
+			wantErr:    false,
+		},
+		{
+			name:       "v6e 256 chips",
+			prefix:     "v6e",
+			totalChips: 256,
+			wantShape:  "16x16",
+			wantErr:    false,
+		},
+		{
+			name:       "tpu7x 1 chip (Fail)",
+			prefix:     "tpu7x",
+			totalChips: 1,
+			wantShape:  "",
+			wantErr:    true,
+		},
+		{
+			name:       "v4 3 cores (Fail)",
+			prefix:     "v4",
+			totalChips: 3,
+			wantShape:  "",
+			wantErr:    true,
+		},
+		{
+			name:       "v5p 7 cores (Fail)",
+			prefix:     "v5p",
+			totalChips: 7,
+			wantShape:  "",
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolvedMachineType := ResolveMachineType(tt.prefix)
+			got, err := ResolveTopologyForChips(fmt.Sprintf("%s-%d", tt.prefix, tt.totalChips), resolvedMachineType)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ResolveTopologyForChips() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.wantShape {
+				t.Errorf("ResolveTopologyForChips() got = %v, want %v", got, tt.wantShape)
+			}
+		})
+	}
+}
+
+func TestIsTPU(t *testing.T) {
+	tests := []struct {
+		accelType string
+		want      bool
+	}{
+		{"v4-8", true},
+		{"v5litepod-8", true},
+		{"v6e-8", true},
+		{"tpu7x", true},
+		{"ct4p-hightpu-4t", true},
+		{"ct5lp-hightpu-8t", true},
+		{"v5litepod-16", true},
+		{"l4-1", false},
+		{"nvidia-tesla-a100", false},
+		{"g2-standard-12", false},
+		{"n2-standard-2", false},
+		{"v1-standard-2", false},
+		{"v5x", false},
+	}
+	for _, tt := range tests {
+		if got := IsTPU(tt.accelType); got != tt.want {
+			t.Errorf("IsTPU(%q) = %v, want %v", tt.accelType, got, tt.want)
+		}
+	}
+}
+
+func TestMatchesTPUFamily(t *testing.T) {
+	tests := []struct {
+		name      string
+		accelType string
+		families  []string
+		want      bool
+	}{
+		{"v6e matches 2D", "v6e-8", valid2DTPUFamilies, true},
+		{"v5litepod matches 2D", "v5litepod-8", valid2DTPUFamilies, true},
+		{"v5litepod matches 2D", "v5litepod-16", valid2DTPUFamilies, true},
+		{"l4 does not match 2D", "l4-1", valid2DTPUFamilies, false},
+		{"v4 matches 3D", "v4-8", valid3DTPUFamilies, true},
+		{"v5p matches 3D", "v5p-8", valid3DTPUFamilies, true},
+		{"v6e does not match 3D", "v6e-8", valid3DTPUFamilies, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := matchesTPUFamily(tt.accelType, tt.families); got != tt.want {
+				t.Errorf("matchesTPUFamily(%q, %v) = %v, want %v", tt.accelType, tt.families, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveMachineType(t *testing.T) {
+	tests := []struct {
+		accelType string
+		want      string
+	}{
+		{"v4-8", "ct4p-hightpu-4t"},
+		{"v5litepod-8", "ct5lp-hightpu-8t"},
+		{"l4-1", "g2-standard-12"},
+		{"unknown", "unknown"},
+		{"ct4p-hightpu-4t", "ct4p-hightpu-4t"},
+	}
+	for _, tt := range tests {
+		if got := ResolveMachineType(tt.accelType); got != tt.want {
+			t.Errorf("ResolveMachineType(%q) = %q, want %q", tt.accelType, got, tt.want)
+		}
+	}
+}
+
+func TestGetCandidatesForShorthand(t *testing.T) {
+	tests := []struct {
+		shorthand string
+		want      []string
+	}{
+		{"v5litepod", []string{"ct5lp-hightpu-1t", "ct5lp-hightpu-4t", "ct5lp-hightpu-8t"}},
+		{"v4", []string{"ct4p-hightpu-4t"}},
+		{"v5p", []string{"ct5p-hightpu-4t"}},
+		{"l4", []string{"g2-standard-12", "g2-standard-24", "g2-standard-48", "g2-standard-96"}},
+		{"unknown", nil},
+	}
+	for _, tt := range tests {
+		got := GetCandidatesForShorthand(tt.shorthand)
+		// Sort for comparison because map iteration order is random
+		slices.Sort(got)
+		slices.Sort(tt.want)
+		if !slices.Equal(got, tt.want) {
+			t.Errorf("GetCandidatesForShorthand(%q) = %v, want %v", tt.shorthand, got, tt.want)
+		}
+	}
+}
+
+func TestValidateHardwareRequest(t *testing.T) {
+	tests := []struct {
+		name        string
+		machineType string
+		topology    string
+		wantErr     bool
+	}{
+		{"Valid TPU v4", "ct4p-hightpu-4t", "2x2x1", false},
+		{"Valid TPU v6e", "v6e-8", "2x2", false},
+		{"Invalid TPU v6e shape", "v6e-8", "3x3", true},
+		{"Valid TPU v5litepod", "v5litepod-16", "4x4", false},
+		{"Invalid TPU v5litepod shape", "v5litepod-16", "3x3", true},
+		{"Invalid TPU v4 dimensions", "ct4p-hightpu-4t", "2x2", true}, // Needs 3D
+		{"Invalid TPU v4 shape", "ct4p-hightpu-4t", "3x3x3", true},
+		{"Unknown TPU family fails", "tpu-v7-8", "2x2x2", true},
+		{"Non-TPU skips validation", "l4-1", "invalid", false},
+		{"Valid non-standard v4 shape", "ct4p-hightpu-4t", "4x4x12", false},
+		{"Valid non-standard v5p shape", "ct5p-hightpu-4t", "4x4x12", false},
+		{"Invalid v5p shape (unsorted)", "ct5p-hightpu-4t", "4x12x4", true},
+		{"Invalid v4 shape (unsorted)", "ct4p-hightpu-4t", "4x12x4", true},
+		{"Topology exceeding max cubes", "ct4p-hightpu-4t", "16x16x32", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateHardwareRequest(tt.machineType, tt.topology)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateHardwareRequest() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCheckTopologyContainment(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested string
+		container string
+		accelType string
+		wantFit   bool
+		wantErr   bool
+	}{
+		{
+			name:      "Perfect fit",
+			requested: "2x2",
+			container: "2x2",
+			accelType: "v6e",
+			wantFit:   true,
+			wantErr:   false,
+		},
+		{
+			name:      "Fits inside",
+			requested: "2x2",
+			container: "4x4",
+			accelType: "v6e",
+			wantFit:   true,
+			wantErr:   false,
+		},
+		{
+			name:      "Doesn't fit (too large)",
+			requested: "4x4",
+			container: "2x2",
+			accelType: "v6e",
+			wantFit:   false,
+			wantErr:   false,
+		},
+		{
+			name:      "Different dimensions",
+			requested: "2x2x1",
+			container: "4x4",
+			accelType: "v6e",
+			wantFit:   false,
+			wantErr:   false,
+		},
+		{
+			name:      "Invalid requested topology (NaN)",
+			requested: "2xfoo",
+			container: "4x4",
+			accelType: "v6e",
+			wantFit:   false,
+			wantErr:   true,
+		},
+		{
+			name:      "Invalid container topology (NaN)",
+			requested: "2x2",
+			container: "4xbar",
+			accelType: "v6e",
+			wantFit:   false,
+			wantErr:   true,
+		},
+		{
+			name:      "V6e invalid subset shape (fits geometrically)",
+			requested: "3x3",
+			container: "4x4",
+			accelType: "v6e",
+			wantFit:   true,
+			wantErr:   false,
+		},
+		{
+			name:      "V4 invalid subset shape (fits geometrically)",
+			requested: "3x3x3",
+			container: "4x4x4",
+			accelType: "v4",
+			wantFit:   true,
+			wantErr:   false,
+		},
+		{
+			name:      "V4 valid non-standard subset shape",
+			requested: "4x4x12",
+			container: "4x4x16",
+			accelType: "v4",
+			wantFit:   true,
+			wantErr:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := CheckTopologyContainment(tt.requested, tt.container, tt.accelType)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("CheckTopologyContainment() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.wantFit {
+				t.Errorf("CheckTopologyContainment() got = %v, want %v", got, tt.wantFit)
+			}
+		})
+	}
+}
+
+func TestIs3DTorusTPU(t *testing.T) {
+	tests := []struct {
+		name        string
+		machineType string
+		wantResult  bool
+	}{
+		{
+			name:        "v4 chip name (Torus)",
+			machineType: "ct4p-hightpu-4t",
+			wantResult:  true,
+		},
+		{
+			name:        "v5p machine name (Torus)",
+			machineType: "ct5p-hightpu-4t",
+			wantResult:  true,
+		},
+		{
+			name:        "v5e machine name (2D Mesh)",
+			machineType: "ct5l-hightpu-4t",
+			wantResult:  false,
+		},
+		{
+			name:        "v6e machine name (2D Mesh)",
+			machineType: "ct6e-standard-8t",
+			wantResult:  false,
+		},
+		{
+			name:        "tpu7x machine name (Exclude)",
+			machineType: "tpu7x-standard-16t",
+			wantResult:  false,
+		},
+		{
+			name:        "Shorthand v4-8",
+			machineType: "v4-8",
+			wantResult:  true,
+		},
+		{
+			name:        "Shorthand v5p-8",
+			machineType: "v5p-8",
+			wantResult:  true,
+		},
+		{
+			name:        "Non-TPU machine type",
+			machineType: "a2-highgpu-1g",
+			wantResult:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Is3DTorusTPU(tt.machineType)
+			if got != tt.wantResult {
+				t.Errorf("Is3DTorusTPU(%q) = %v, want %v", tt.machineType, got, tt.wantResult)
+			}
+		})
 	}
 }

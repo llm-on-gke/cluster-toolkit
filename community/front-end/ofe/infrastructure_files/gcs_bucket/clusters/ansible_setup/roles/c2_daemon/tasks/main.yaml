@@ -40,9 +40,10 @@
     name:
     - requests
     - pexpect
+    - PyYAML
     - google-cloud-storage
     - google-cloud-pubsub
-    - addict
+
     - google-api-python-client
     - google-cloud-secret-manager
     - prometheus_client

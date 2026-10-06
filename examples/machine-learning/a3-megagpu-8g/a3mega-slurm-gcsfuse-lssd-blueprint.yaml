@@ -31,7 +31,7 @@ vars:
   a3mega_maintenance_interval: ""
   enable_placement: false
   local_mount_homefs: /home
-  build_slurm_from_git_ref: 6.12.1
+  build_slurm_from_git_ref: 6.12.3
   instance_image:
     family: $(vars.final_image_family)
     project: $(vars.project_id)
@@ -613,9 +613,9 @@ deployment_groups:
         content: |
           #!/bin/bash
           # IMPORTANT: This script should be run *last* in any sequence of setup steps
-          # that use 'gsutil' or other gcloud commands.
+          # that use 'gcloud' commands (such as 'gcloud storage').
           # This is because removing the Snap version of the GCloud SDK can temporarily
-          # break existing 'gsutil' paths, which might disrupt other scripts still running
+          # break existing 'gcloud' paths, which might disrupt other scripts still running
           # that rely on the Snap-installed version.
 
           set -e -o pipefail
@@ -636,7 +636,7 @@ deployment_groups:
           curl -o /usr/share/keyrings/cloud.google.asc https://packages.cloud.google.com/apt/doc/apt-key.gpg
           apt-get update
           apt-get install --assume-yes google-cloud-cli
-          # Clean up the bash executable hash for subsequent steps using gsutil
+          # Clean up the bash executable hash for subsequent steps using gcloud
           hash -r
 
 - group: slurm-build
@@ -804,7 +804,7 @@ deployment_groups:
       machine_type: c2-standard-8
       enable_cleanup_compute: true
       enable_external_prolog_epilog: true
-      slurm_conf_tpl: modules/embedded/community/modules/scheduler/schedmd-slurm-gcp-v6-controller/etc/long-prolog-slurm.conf.tpl
+      slurm_conf_tpl: ../_modules/embedded/community/modules/scheduler/schedmd-slurm-gcp-v6-controller/etc/long-prolog-slurm.conf.tpl
       controller_startup_script: $(controller_startup.startup_script)
       login_startup_script: $(login_startup.startup_script)
       prolog_scripts:

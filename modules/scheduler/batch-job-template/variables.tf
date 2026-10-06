@@ -40,7 +40,7 @@ variable "job_id" {
 }
 
 variable "job_filename" {
-  description = "The filename of the generated job template file. Will default to `cloud-batch-<job_id>.json` if not specified"
+  description = "The filename of the generated job template file. Will default to `<job_id>.yaml` if not specified"
   type        = string
   default     = null
 }
@@ -66,6 +66,16 @@ variable "task_count_per_node" {
   description = "Max number of tasks that can be run on a VM at the same time. If not specified, Batch will decide a value."
   type        = number
   default     = null
+}
+
+variable "parallelism" {
+  description = "Max number of tasks that can run in parallel across the job. If null, defaults to min(task_count, 1000) for standard jobs, or task_count if mpi_mode is true. When mpi_mode is true, Batch requires parallelism == task_count."
+  type        = number
+  default     = null
+  validation {
+    condition     = var.parallelism == null ? true : (var.parallelism > 0 && floor(var.parallelism) == var.parallelism)
+    error_message = "The parallelism value must be an integer greater than 0."
+  }
 }
 
 variable "mpi_mode" {
@@ -198,7 +208,7 @@ variable "instance_image" {
   type        = map(string)
   default = {
     project = "cloud-hpc-image-public"
-    family  = "hpc-rocky-linux-8"
+    family  = "hpc-rocky-linux-9"
   }
 
   validation {

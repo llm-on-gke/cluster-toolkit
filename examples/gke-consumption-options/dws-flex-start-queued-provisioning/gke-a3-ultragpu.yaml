@@ -124,7 +124,7 @@ deployment_groups:
     source: modules/scheduler/gke-cluster
     use: [gke-a3-ultra-net-0, workload_service_account]
     settings:
-      system_node_pool_machine_type: "e2-standard-16"
+      system_node_pool_machine_type: "n2d-standard-16"
       system_node_pool_disk_size_gb: $(vars.system_node_pool_disk_size_gb)
       system_node_pool_taints: []
       enable_dcgm_monitoring: true
@@ -152,7 +152,7 @@ deployment_groups:
         ))
       # Cluster versions cannot be updated through the toolkit after creation
       # Please manage cluster version from the Google Cloud Console directly
-      version_prefix: "1.32."
+      version_prefix: "1.35."
     outputs: [instructions]
 
   - id: a3-ultragpu-pool
@@ -200,4 +200,5 @@ deployment_groups:
       jobset:
         install: true
       apply_manifests:
-      - source: $(vars.nccl_installer_path)
+      - name: nccl-installer
+        source: $(vars.nccl_installer_path)

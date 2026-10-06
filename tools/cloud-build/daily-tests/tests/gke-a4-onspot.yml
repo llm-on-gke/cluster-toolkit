@@ -24,6 +24,8 @@ network: "{{ deployment_name }}-net-0"
 remote_node: "{{ deployment_name }}-remote-node-0"
 static_node_count: 2
 instance_type: a4
+scheduler: "gke"
+chs_nodepools: "a4-highgpu-8g-a4-pool"
 accelerator_type: nvidia-b200
 num_gpus: 16
 k8s_service_account_name: workload-identity-k8s-sa
@@ -34,12 +36,17 @@ cli_deployment_vars:
   authorized_cidr: "{{ build_ip.stdout }}/32"
   gcp_public_cidrs_access_enabled: true
   k8s_service_account_name: "{{ k8s_service_account_name}}"
+  spot: "{{ enable_spot | default(true) }}"
+  placement_policy:
+    type: COMPACT
 custom_vars:
   project: "{{ project }}"
   instance_labels:
     a4_onspot: true
   enable_spot: true
 post_deploy_tests:
+- test-validation/test-gcsfuse-mounts.yml
 - test-validation/test-gke-job.yml
 - test-validation/test-gke-a4.yml
 - test-validation/test-gke-kueue-config.yml
+- test-validation/test-chs.yml

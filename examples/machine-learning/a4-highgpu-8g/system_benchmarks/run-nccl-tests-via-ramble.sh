@@ -32,7 +32,7 @@ by adding the following to ${HOME}/.enroot/.credentials:
 
   machine us-docker.pkg.dev login oauth2accesstoken password \$(gcloud auth print-access-token)
 
-And will clone ramble (https://github.com/GoogleCloudPlatform/ramble.git)
+And will clone ramble (https://github.com/Ramble-Project/ramble.git)
 to "${SOFTWARE_INSTALL}"/, and it will create an enroot "sqsh" file located
 in your ${HOME}/.enroot/ folder. Afterwards it will create a ramble workspace
 to run a number of NCCL tests in $(readlink -f "${TEST_DIR}"/).
@@ -44,7 +44,26 @@ read -t 30 -rp "To continue, hit [enter]. To cancel, type [Ctrl-c]. Will auto-co
 mkdir -p "${TEST_DIR}"
 
 # Install prerequisites
-sudo apt-get install -y python3-venv jq
+# Handle Munge service conflict
+MUNGE_ACTIVE=false
+if systemctl is-active --quiet munge; then
+	MUNGE_ACTIVE=true
+	echo "Stopping Munge to prevent package lock..."
+	sudo systemctl stop munge || true
+fi
+
+# Non-interactive installation
+echo "Installing prerequisites..."
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+	-o Dpkg::Options::="--force-confdef" \
+	-o Dpkg::Options::="--force-confold" \
+	python3-venv jq
+
+# Restart Munge if it was active
+if [ "$MUNGE_ACTIVE" = true ]; then
+	echo "Restarting Munge..."
+	sudo systemctl start munge || true
+fi
 
 # Create enroot credentials set up for artifact registry
 mkdir -p "${HOME}"/.enroot/
@@ -58,7 +77,7 @@ EOF
 fi
 
 # Install ramble and make world read/writeable.
-sudo git clone -c feature.manyFiles=true https://github.com/GoogleCloudPlatform/ramble.git "${SOFTWARE_INSTALL}"/ramble || true
+sudo git clone -c feature.manyFiles=true https://github.com/Ramble-Project/ramble.git "${SOFTWARE_INSTALL}"/ramble || true
 sudo git -C "${SOFTWARE_INSTALL}"/ramble checkout 2a020babedd68be15448f3893d2a245fcaa8bd73
 sudo chmod -R a+w "${SOFTWARE_INSTALL}"/ramble
 
@@ -100,8 +119,8 @@ ramble:
     hostlist: \${SLURM_JOB_NODELIST}
 
     container_dir: "${SOFTWARE_INSTALL}/ramble/sqsh"
-    container_name: nccl-plugin-gib-diagnostic-v1.1.0
-    container_uri: docker://us-docker.pkg.dev#gce-ai-infra/gpudirect-gib/nccl-plugin-gib-diagnostic:v1.1.0
+    container_name: nccl-plugin-gib-diagnostic-v1.1.2
+    container_uri: docker://us-docker.pkg.dev#gce-ai-infra/gpudirect-gib/nccl-plugin-gib-diagnostic:v1.1.2
     processes_per_node: 8
     processes_per_node: '{gpus_per_node}'
     gpus_per_node: '8'

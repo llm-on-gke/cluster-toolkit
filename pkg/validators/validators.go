@@ -18,18 +18,32 @@ import (
 	"errors"
 	"fmt"
 	"hpc-toolkit/pkg/config"
+	"hpc-toolkit/pkg/dependencies"
 	"hpc-toolkit/pkg/logging"
 	"hpc-toolkit/pkg/modulereader"
 	"strings"
 
 	"github.com/zclconf/go-cty/cty"
+	"google.golang.org/api/googleapi"
 )
 
 func projectError(p string) error {
+	hint := "It is possible the machine you are working on has not been authenticated.\n"
+	if dependencies.HasBinary("gcloud") {
+		hint += "Try to run `gcloud auth application-default login`"
+	} else {
+		hint += "How to fix:\n" +
+			"1. Recommended: Install the Google Cloud SDK and authenticate.\n" +
+			"   -> Install: https://cloud.google.com/sdk/docs/install\n" +
+			"   -> Authenticate: Run `gcloud auth application-default login`\n\n" +
+			"2. Alternative: Use a Service Account Key file (Air-gapped/Minimal VMs).\n" +
+			"   -> Set the environment variable:\n" +
+			"      export GOOGLE_APPLICATION_CREDENTIALS=\"/path/to/your/key.json\""
+	}
+
 	return config.HintError{
-		Err: fmt.Errorf("project %q does not exist or your credentials do not have permission to access it", p),
-		Hint: "It is possible the machine you are working on has not been authenticated.\n" +
-			"Try to run `gcloud auth application-default login`",
+		Err:  fmt.Errorf("project %q does not exist or your credentials do not have permission to access it", p),
+		Hint: hint,
 	}
 }
 
@@ -42,9 +56,24 @@ const credentialsHint = "load application default credentials following instruct
 var ErrNoDefaultCredentials = errors.New("could not find application default credentials")
 
 func handleClientError(e error) error {
+	if e == nil {
+		return nil
+	}
 	if strings.Contains(e.Error(), "could not find default credentials") {
 		return config.HintError{Hint: credentialsHint, Err: ErrNoDefaultCredentials}
 	}
+
+	// GoogleAPI Error?
+	var gErr *googleapi.Error
+	if errors.As(e, &gErr) {
+		if gErr.Code == 403 {
+			return fmt.Errorf("GCP API permission denied or API not enabled. Check IAM roles and ensure Compute Engine API is enabled. details: %w", e)
+		}
+		if gErr.Code == 429 {
+			return fmt.Errorf("GCP API rate limit exceeded. Please wait or increase quota. details: %w", e)
+		}
+	}
+
 	return e
 }
 
@@ -70,6 +99,7 @@ func implementations() map[string]func(config.Blueprint, config.Dict) error {
 		testZoneInRegionName:              testZoneInRegion,
 		testModuleNotUsedName:             testModuleNotUsed,
 		testDeploymentVariableNotUsedName: testDeploymentVariableNotUsed,
+		testQuotaAvailabilityName:         testQuotaAvailability,
 		testMachineTypeInZone:             testMachineTypeInZoneAvailability,
 		testReservationExistsName:         testReservationExists,
 		testDiskTypeInZone:                testDiskTypeInZoneAvailability,
@@ -227,8 +257,7 @@ func defaults(bp config.Blueprint) []config.Validator {
 		}, config.Validator{
 			Validator: testApisEnabledName,
 			Inputs:    inputs,
-		},
-		)
+		})
 	}
 
 	if projectIDExists && regionExists {

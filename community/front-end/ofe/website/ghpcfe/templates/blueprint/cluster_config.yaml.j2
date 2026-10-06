@@ -1,4 +1,4 @@
-{#
+{% comment %}
 Copyright 2026 "Google LLC"
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +12,7 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-#}
+{% endcomment %}
 
 blueprint_name: {{ cluster.cloud_id }}
 
@@ -79,8 +79,9 @@ deployment_groups:
     kind: terraform
     id: slurm_controller
     settings:
+      enable_slurm_auth: {{ cluster.enable_slurm_auth | lower }}
       instance_image:
-        family: slurm-gcp-6-12-hpc-rocky-linux-8
+        family: slurm-gcp-6-12-hpc-rocky-linux-9
         project: schedmd-slurm-public
       cloud_parameters:
         resume_rate: 0
@@ -104,11 +105,11 @@ deployment_groups:
       controller_startup_script: |
         #!/bin/bash
         echo "******************************************** CALLING CONTROLLER STARTUP"
-        gsutil cp gs://{{ startup_bucket }}/clusters/{{ cluster.id }}/bootstrap_controller.sh - | bash
+        gcloud storage cat gs://{{ startup_bucket }}/clusters/{{ cluster.id }}/bootstrap_controller.sh | bash
       login_startup_script: |
         #!/bin/bash
         echo "******************************************** CALLING LOGIN STARTUP"
-        gsutil cp gs://{{ startup_bucket }}/clusters/{{ cluster.id }}/bootstrap_login.sh - | bash
+        gcloud storage cat gs://{{ startup_bucket }}/clusters/{{ cluster.id }}/bootstrap_login.sh | bash
     use:
     - slurm_login
 {{ controller_uses | safe }}
@@ -118,7 +119,7 @@ deployment_groups:
     id: slurm_login
     settings:
       instance_image:
-        family: slurm-gcp-6-12-hpc-rocky-linux-8
+        family: slurm-gcp-6-12-hpc-rocky-linux-9
         project: schedmd-slurm-public
       num_instances: {{ cluster.num_login_nodes }}
       subnetwork_self_link: "projects/{{ cluster.project_id }}/regions/{{ cluster.cloud_region }}/subnetworks/{{ cluster.subnet.cloud_id }}"

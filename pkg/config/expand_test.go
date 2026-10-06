@@ -17,6 +17,7 @@ package config
 import (
 	"fmt"
 	"hpc-toolkit/pkg/modulereader"
+	"strings"
 
 	"github.com/zclconf/go-cty/cty"
 	. "gopkg.in/check.v1"
@@ -442,5 +443,431 @@ func (s *zeroSuite) TestOutputNamesByGroup(c *C) {
 		c.Check(got, DeepEquals, map[GroupName][]string{
 			"zebra": {"length_stripes"},
 		})
+	}
+}
+
+func (s *zeroSuite) TestExpandGlobalLabels(c *C) {
+	{ // AddCreatorLabel false
+		bp := Blueprint{
+			BlueprintName:   "tree",
+			Vars:            NewDict(map[string]cty.Value{}),
+			AddCreatorLabel: false,
+		}
+		bp.expandGlobalLabels()
+		labelsVal := bp.Vars.Get("labels")
+
+		expectedLabels := cty.ObjectVal(map[string]cty.Value{
+			"ghpc_blueprint":  cty.StringVal("tree"),
+			"ghpc_deployment": GlobalRef("deployment_name").AsValue(),
+		})
+		c.Check(labelsVal, DeepEquals, expectedLabels)
+	}
+
+	{ // AddCreatorLabel true
+		bp := Blueprint{
+			BlueprintName:   "tree",
+			Vars:            NewDict(map[string]cty.Value{}),
+			AddCreatorLabel: true,
+			CreatorUsername: "testuser",
+		}
+		bp.expandGlobalLabels()
+		labelsVal := bp.Vars.Get("labels")
+
+		expectedLabels := cty.ObjectVal(map[string]cty.Value{
+			"ghpc_blueprint":  cty.StringVal("tree"),
+			"ghpc_deployment": GlobalRef("deployment_name").AsValue(),
+			"ghpc_creator":    cty.StringVal("testuser"),
+		})
+		c.Check(labelsVal, DeepEquals, expectedLabels)
+	}
+
+	{ // AddCreatorLabel true with sanitization
+		bp := Blueprint{
+			BlueprintName:   "tree",
+			Vars:            NewDict(map[string]cty.Value{}),
+			AddCreatorLabel: true,
+			CreatorUsername: "user@example.com",
+		}
+		bp.expandGlobalLabels()
+		labelsVal := bp.Vars.Get("labels")
+
+		expectedLabels := cty.ObjectVal(map[string]cty.Value{
+			"ghpc_blueprint":  cty.StringVal("tree"),
+			"ghpc_deployment": GlobalRef("deployment_name").AsValue(),
+			"ghpc_creator":    cty.StringVal("user_example_com"),
+		})
+		c.Check(labelsVal, DeepEquals, expectedLabels)
+	}
+
+	{ // AddCreatorLabel true with uppercase and special characters
+		bp := Blueprint{
+			BlueprintName:   "tree",
+			Vars:            NewDict(map[string]cty.Value{}),
+			AddCreatorLabel: true,
+			CreatorUsername: "User+Name@Example.COM",
+		}
+		bp.expandGlobalLabels()
+		labelsVal := bp.Vars.Get("labels")
+
+		expectedLabels := cty.ObjectVal(map[string]cty.Value{
+			"ghpc_blueprint":  cty.StringVal("tree"),
+			"ghpc_deployment": GlobalRef("deployment_name").AsValue(),
+			"ghpc_creator":    cty.StringVal("user_name_example_com"),
+		})
+		c.Check(labelsVal, DeepEquals, expectedLabels)
+	}
+
+	{ // AddCreatorLabel true with long username
+		longUsername := "a" + strings.Repeat("b", 70)
+		bp := Blueprint{
+			BlueprintName:   "tree",
+			Vars:            NewDict(map[string]cty.Value{}),
+			AddCreatorLabel: true,
+			CreatorUsername: longUsername,
+		}
+		bp.expandGlobalLabels()
+		labelsVal := bp.Vars.Get("labels")
+
+		expectedLabels := cty.ObjectVal(map[string]cty.Value{
+			"ghpc_blueprint":  cty.StringVal("tree"),
+			"ghpc_deployment": GlobalRef("deployment_name").AsValue(),
+			"ghpc_creator":    cty.StringVal("a" + strings.Repeat("b", 62)),
+		})
+		c.Check(labelsVal, DeepEquals, expectedLabels)
+	}
+
+	{ // AddCreatorLabel true with spaces and symbols
+		bp := Blueprint{
+			BlueprintName:   "tree",
+			Vars:            NewDict(map[string]cty.Value{}),
+			AddCreatorLabel: true,
+			CreatorUsername: "user name!#$",
+		}
+		bp.expandGlobalLabels()
+		labelsVal := bp.Vars.Get("labels")
+
+		expectedLabels := cty.ObjectVal(map[string]cty.Value{
+			"ghpc_blueprint":  cty.StringVal("tree"),
+			"ghpc_deployment": GlobalRef("deployment_name").AsValue(),
+			"ghpc_creator":    cty.StringVal("user_name___"),
+		})
+		c.Check(labelsVal, DeepEquals, expectedLabels)
+	}
+
+	{ // AddCreatorLabel true with leading number
+		bp := Blueprint{
+			BlueprintName:   "tree",
+			Vars:            NewDict(map[string]cty.Value{}),
+			AddCreatorLabel: true,
+			CreatorUsername: "123user",
+		}
+		bp.expandGlobalLabels()
+		labelsVal := bp.Vars.Get("labels")
+
+		expectedLabels := cty.ObjectVal(map[string]cty.Value{
+			"ghpc_blueprint":  cty.StringVal("tree"),
+			"ghpc_deployment": GlobalRef("deployment_name").AsValue(),
+			"ghpc_creator":    cty.StringVal("123user"),
+		})
+		c.Check(labelsVal, DeepEquals, expectedLabels)
+	}
+}
+
+func (s *zeroSuite) TestCheckInputValueMatchesType_Panic(c *C) {
+	m := tMod("yarn").
+		inputs(modulereader.VarInfo{Name: "bad_input", Type: cty.String}).
+		set("bad_input", cty.NilVal).
+		build()
+
+	bp := Blueprint{
+		Groups: []Group{
+			{Modules: []Module{m}}},
+	}
+
+	mp := Root.Groups.At(0).Modules.At(0)
+	err := bp.expandModule(mp, &m)
+	c.Assert(err, NotNil)
+	c.Check(err, ErrorMatches, ".*panic during type conversion for \"bad_input\".*")
+}
+
+func (s *zeroSuite) TestDeduplicateDranetTemplates(c *C) {
+	// Case 1: Standard deduplication for same device class (netdev.google.com)
+	{
+		bp := &Blueprint{}
+		m1 := Module{
+			ID:     "pool-a",
+			Source: "community/modules/compute/gke-node-pool",
+			Settings: NewDict(map[string]cty.Value{
+				"enable_dranet": cty.BoolVal(true),
+				"machine_type":  cty.StringVal("ct6e-standard-4t"), // auto-detects to netdev.google.com
+			}),
+		}
+		m2 := Module{
+			ID:     "pool-b",
+			Source: "community/modules/compute/gke-node-pool",
+			Settings: NewDict(map[string]cty.Value{
+				"enable_dranet": cty.BoolVal(true),
+				"machine_type":  cty.StringVal("ct6e-standard-4t"), // auto-detects to netdev.google.com
+			}),
+		}
+		bp.Groups = []Group{{Modules: []Module{m1, m2}}}
+
+		bp.deduplicateDranetTemplates()
+
+		// pool-a is first, should install
+		c.Assert(bp.Groups[0].Modules[0].Settings.Has("install_dranet_template"), Equals, true)
+		c.Check(bp.Groups[0].Modules[0].Settings.Get("install_dranet_template"), DeepEquals, cty.BoolVal(true))
+
+		// pool-b is second of same class, should NOT install
+		c.Assert(bp.Groups[0].Modules[1].Settings.Has("install_dranet_template"), Equals, true)
+		c.Check(bp.Groups[0].Modules[1].Settings.Get("install_dranet_template"), DeepEquals, cty.BoolVal(false))
+	}
+
+	// Case 2: Different device classes (mrdma.google.com vs netdev.google.com) - both should install
+	{
+		bp := &Blueprint{}
+		m1 := Module{
+			ID:     "pool-a",
+			Source: "community/modules/compute/gke-node-pool",
+			Settings: NewDict(map[string]cty.Value{
+				"enable_dranet": cty.BoolVal(true),
+				"machine_type":  cty.StringVal("a3-ultragpu-8g"), // auto-detects to mrdma.google.com
+			}),
+		}
+		m2 := Module{
+			ID:     "pool-b",
+			Source: "community/modules/compute/gke-node-pool",
+			Settings: NewDict(map[string]cty.Value{
+				"enable_dranet": cty.BoolVal(true),
+				"machine_type":  cty.StringVal("ct6e-standard-4t"), // auto-detects to netdev.google.com
+			}),
+		}
+		bp.Groups = []Group{{Modules: []Module{m1, m2}}}
+
+		bp.deduplicateDranetTemplates()
+
+		// Both are first of their class, both should install
+		c.Assert(bp.Groups[0].Modules[0].Settings.Has("install_dranet_template"), Equals, true)
+		c.Check(bp.Groups[0].Modules[0].Settings.Get("install_dranet_template"), DeepEquals, cty.BoolVal(true))
+
+		c.Assert(bp.Groups[0].Modules[1].Settings.Has("install_dranet_template"), Equals, true)
+		c.Check(bp.Groups[0].Modules[1].Settings.Get("install_dranet_template"), DeepEquals, cty.BoolVal(true))
+	}
+
+	// Case 3: Explicit device class name overrides auto-detect
+	{
+		bp := &Blueprint{}
+		m1 := Module{
+			ID:     "pool-a",
+			Source: "community/modules/compute/gke-node-pool",
+			Settings: NewDict(map[string]cty.Value{
+				"enable_dranet":            cty.BoolVal(true),
+				"dranet_device_class_name": cty.StringVal("custom.google.com"),
+			}),
+		}
+		m2 := Module{
+			ID:     "pool-b",
+			Source: "community/modules/compute/gke-node-pool",
+			Settings: NewDict(map[string]cty.Value{
+				"enable_dranet":            cty.BoolVal(true),
+				"dranet_device_class_name": cty.StringVal("custom.google.com"),
+			}),
+		}
+		bp.Groups = []Group{{Modules: []Module{m1, m2}}}
+
+		bp.deduplicateDranetTemplates()
+
+		c.Assert(bp.Groups[0].Modules[0].Settings.Has("install_dranet_template"), Equals, true)
+		c.Check(bp.Groups[0].Modules[0].Settings.Get("install_dranet_template"), DeepEquals, cty.BoolVal(true))
+
+		c.Assert(bp.Groups[0].Modules[1].Settings.Has("install_dranet_template"), Equals, true)
+		c.Check(bp.Groups[0].Modules[1].Settings.Get("install_dranet_template"), DeepEquals, cty.BoolVal(false))
+	}
+
+	// Case 4: Non-GKE node pool module or enable_dranet=false should be ignored
+	{
+		bp := &Blueprint{}
+		m1 := Module{
+			ID:     "not-gke-pool",
+			Source: "community/modules/compute/gke-cluster",
+			Settings: NewDict(map[string]cty.Value{
+				"enable_dranet": cty.BoolVal(true),
+			}),
+		}
+		m2 := Module{
+			ID:     "pool-a",
+			Source: "community/modules/compute/gke-node-pool",
+			Settings: NewDict(map[string]cty.Value{
+				"enable_dranet": cty.BoolVal(false),
+			}),
+		}
+		bp.Groups = []Group{{Modules: []Module{m1, m2}}}
+
+		bp.deduplicateDranetTemplates()
+
+		c.Check(bp.Groups[0].Modules[0].Settings.Has("install_dranet_template"), Equals, false)
+		c.Check(bp.Groups[0].Modules[1].Settings.Has("install_dranet_template"), Equals, false)
+	}
+
+	// Case 5: Remote module sources with query parameters should be correctly matched
+	{
+		bp := &Blueprint{}
+		m1 := Module{
+			ID:     "pool-a",
+			Source: "github.com/GoogleCloudPlatform/cluster-toolkit//modules/compute/gke-node-pool?ref=v1.15.0&depth=1",
+			Settings: NewDict(map[string]cty.Value{
+				"enable_dranet": cty.BoolVal(true),
+				"machine_type":  cty.StringVal("ct6e-standard-4t"),
+			}),
+		}
+		m2 := Module{
+			ID:     "pool-b",
+			Source: "github.com/GoogleCloudPlatform/cluster-toolkit//modules/compute/gke-node-pool?ref=v1.15.0&depth=1",
+			Settings: NewDict(map[string]cty.Value{
+				"enable_dranet": cty.BoolVal(true),
+				"machine_type":  cty.StringVal("ct6e-standard-4t"),
+			}),
+		}
+		bp.Groups = []Group{{Modules: []Module{m1, m2}}}
+
+		bp.deduplicateDranetTemplates()
+
+		// Both should be correctly identified as GKE node pools, and deduplicated
+		c.Assert(bp.Groups[0].Modules[0].Settings.Has("install_dranet_template"), Equals, true)
+		c.Check(bp.Groups[0].Modules[0].Settings.Get("install_dranet_template"), DeepEquals, cty.BoolVal(true))
+
+		c.Assert(bp.Groups[0].Modules[1].Settings.Has("install_dranet_template"), Equals, true)
+		c.Check(bp.Groups[0].Modules[1].Settings.Get("install_dranet_template"), DeepEquals, cty.BoolVal(false))
+	}
+
+}
+
+func (s *zeroSuite) TestExpandWorkloadPolicy(c *C) {
+	// Case 1: Injects conditional expression into TPU workload_policy when enable_dynamic_slicing_for_tpus is in Vars
+	{
+		bp := Blueprint{
+			Vars: NewDict(map[string]cty.Value{
+				"enable_dynamic_slicing_for_tpus": cty.BoolVal(false),
+			}),
+		}
+		wpMod := Module{
+			ID:     "workload_policy",
+			Source: "modules/compute/resource-policy",
+			Settings: NewDict(map[string]cty.Value{
+				"workload_policy": cty.ObjectVal(map[string]cty.Value{
+					"accelerator_topology": cty.StringVal("2x2x2"),
+					"type":                 cty.StringVal("HIGH_THROUGHPUT"),
+				}),
+			}),
+		}
+		bp.Groups = []Group{{Modules: []Module{wpMod}}}
+
+		expandWorkloadPolicy(bp, &bp.Groups[0].Modules[0])
+
+		wpVal := bp.Groups[0].Modules[0].Settings.Get("workload_policy")
+		wpMap := wpVal.AsValueMap()
+		modeVal, ok := wpMap["accelerator_topology_mode"]
+		c.Assert(ok, Equals, true)
+		exp, isExp := IsExpressionValue(modeVal)
+		c.Assert(isExp, Equals, true)
+		c.Check(string(exp.Tokenize().Bytes()), Equals, `(var.enable_dynamic_slicing_for_tpus)?"PROVISION_ONLY":null`)
+		c.Check(strings.Contains(string(TokensForValue(wpVal).Bytes()), `accelerator_topology_mode = (var.enable_dynamic_slicing_for_tpus) ? "PROVISION_ONLY" : null`), Equals, true)
+
+		// Evaluates to null when enable_dynamic_slicing_for_tpus is false
+		evalVal, err := bp.Eval(wpVal)
+		c.Assert(err, IsNil)
+		c.Check(evalVal.AsValueMap()["accelerator_topology_mode"].IsNull(), Equals, true)
+
+		// Evaluates to PROVISION_ONLY when enable_dynamic_slicing_for_tpus is true
+		bp.Vars = bp.Vars.With("enable_dynamic_slicing_for_tpus", cty.BoolVal(true))
+		evalValTrue, err := bp.Eval(wpVal)
+		c.Assert(err, IsNil)
+		c.Check(evalValTrue.AsValueMap()["accelerator_topology_mode"], DeepEquals, cty.StringVal("PROVISION_ONLY"))
+	}
+
+	// Case 2: Explicit accelerator_topology_mode set by user is preserved
+	{
+		bp := Blueprint{
+			Vars: NewDict(map[string]cty.Value{
+				"enable_dynamic_slicing_for_tpus": cty.BoolVal(true),
+			}),
+		}
+		wpMod := Module{
+			ID:     "workload_policy",
+			Source: "modules/compute/resource-policy",
+			Settings: NewDict(map[string]cty.Value{
+				"workload_policy": cty.ObjectVal(map[string]cty.Value{
+					"accelerator_topology":      cty.StringVal("2x2x2"),
+					"type":                      cty.StringVal("HIGH_THROUGHPUT"),
+					"accelerator_topology_mode": cty.StringVal("AUTO_CONNECT"),
+				}),
+			}),
+		}
+		bp.Groups = []Group{{Modules: []Module{wpMod}}}
+
+		expandWorkloadPolicy(bp, &bp.Groups[0].Modules[0])
+
+		wpMap := bp.Groups[0].Modules[0].Settings.Get("workload_policy").AsValueMap()
+		c.Check(wpMap["accelerator_topology_mode"], DeepEquals, cty.StringVal("AUTO_CONNECT"))
+	}
+
+	// Case 3: Workload policy without accelerator_topology or with 2D GPU topology (e.g., 1x72) is untouched
+	{
+		bp := Blueprint{
+			Vars: NewDict(map[string]cty.Value{
+				"enable_dynamic_slicing_for_tpus": cty.BoolVal(true),
+			}),
+		}
+		noTopoMod := Module{
+			ID:     "gpu_distance_policy",
+			Source: "modules/compute/resource-policy",
+			Settings: NewDict(map[string]cty.Value{
+				"workload_policy": cty.ObjectVal(map[string]cty.Value{
+					"max_topology_distance": cty.StringVal("SUBBLOCK"),
+					"type":                  cty.StringVal("HIGH_THROUGHPUT"),
+				}),
+			}),
+		}
+		gpuTopoMod := Module{
+			ID:     "a4x_workload_policy",
+			Source: "modules/compute/resource-policy",
+			Settings: NewDict(map[string]cty.Value{
+				"workload_policy": cty.ObjectVal(map[string]cty.Value{
+					"accelerator_topology": cty.StringVal("1x72"),
+					"type":                 cty.StringVal("HIGH_THROUGHPUT"),
+				}),
+			}),
+		}
+		bp.Groups = []Group{{Modules: []Module{noTopoMod, gpuTopoMod}}}
+
+		expandWorkloadPolicy(bp, &bp.Groups[0].Modules[0])
+		expandWorkloadPolicy(bp, &bp.Groups[0].Modules[1])
+
+		_, existsNoTopo := bp.Groups[0].Modules[0].Settings.Get("workload_policy").AsValueMap()["accelerator_topology_mode"]
+		c.Check(existsNoTopo, Equals, false)
+		_, existsGpuTopo := bp.Groups[0].Modules[1].Settings.Get("workload_policy").AsValueMap()["accelerator_topology_mode"]
+		c.Check(existsGpuTopo, Equals, false)
+	}
+
+	// Case 4: Blueprint without enable_dynamic_slicing_for_tpus leaves workload_policy untouched
+	{
+		bp := Blueprint{}
+		wpMod := Module{
+			ID:     "workload_policy",
+			Source: "modules/compute/resource-policy",
+			Settings: NewDict(map[string]cty.Value{
+				"workload_policy": cty.ObjectVal(map[string]cty.Value{
+					"accelerator_topology": cty.StringVal("2x2x2"),
+					"type":                 cty.StringVal("HIGH_THROUGHPUT"),
+				}),
+			}),
+		}
+		bp.Groups = []Group{{Modules: []Module{wpMod}}}
+
+		expandWorkloadPolicy(bp, &bp.Groups[0].Modules[0])
+
+		wpMap := bp.Groups[0].Modules[0].Settings.Get("workload_policy").AsValueMap()
+		_, exists := wpMap["accelerator_topology_mode"]
+		c.Check(exists, Equals, false)
 	}
 }

@@ -39,14 +39,14 @@ RUN wget -q "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terra
     rm terraform.zip
 
 # Install Packer
-ARG PACKER_VERSION=1.8.6
+ARG PACKER_VERSION=1.15.3
 RUN wget -q "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip" -O packer.zip && \
-    unzip packer.zip && \
+    unzip -o packer.zip && \
     mv packer /usr/local/bin/ && \
     rm packer.zip
 
 # Install Go
-ARG GO_VERSION=1.24.0
+ARG GO_VERSION=1.26.0
 RUN wget -q "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -O go.tar.gz && \
     tar -C /usr/local -xzf go.tar.gz && \
     rm go.tar.gz

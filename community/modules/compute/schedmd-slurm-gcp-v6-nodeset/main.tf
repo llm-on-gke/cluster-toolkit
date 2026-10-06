@@ -29,10 +29,30 @@ module "gpu" {
 
   machine_type      = var.machine_type
   guest_accelerator = var.guest_accelerator
+  machine_configs   = var.machine_configs
 }
 
 locals {
   guest_accelerator = module.gpu.guest_accelerator
+  # GPUs per VM: attached accelerators, else the "-Ng" suffix in the machine type name.
+  # The literal fallback never sizes a slice MIG; outputs.tf requires a determinable count there.
+  gpu_count = coalesce(
+    try(local.guest_accelerator[0].count, null),
+    try(tonumber(regex("-([0-9]+)g", var.machine_type)[0]), null),
+    4
+  )
+
+  is_tpu = startswith(var.machine_type, "ct") || startswith(var.machine_type, "tpu")
+  tpu_topo_valid = var.accelerator_topology != null && var.accelerator_topology != "" && can(
+    regex("^[1-9][0-9]*[xX][1-9][0-9]*([xX][1-9][0-9]*)?$", trimspace(var.accelerator_topology))
+  )
+  tpu_slice_vms = local.is_tpu && local.tpu_topo_valid ? (
+    (
+      tonumber(split("x", lower(trimspace(var.accelerator_topology)))[0]) *
+      tonumber(split("x", lower(trimspace(var.accelerator_topology)))[1]) *
+      coalesce(try(tonumber(split("x", lower(trimspace(var.accelerator_topology)))[2]), null), 1)
+    ) / 4
+  ) : 0
 
   disable_automatic_updates_metadata = var.allow_automatic_updates ? {} : { google_disable_automatic_updates = "TRUE" }
 
@@ -48,6 +68,7 @@ locals {
       disk_name                           = ad.disk_name
       device_name                         = ad.device_name
       disk_type                           = ad.disk_type
+      disk_storage_pool                   = ad.disk_storage_pool
       disk_size_gb                        = ad.disk_size_gb
       disk_labels                         = merge(ad.disk_labels, local.labels)
       auto_delete                         = ad.auto_delete
@@ -79,11 +100,13 @@ locals {
     node_conf              = var.node_conf
     nodeset_name           = local.name
     dws_flex               = var.dws_flex
+    provisioning_engine    = var.provisioning_engine
 
     disk_auto_delete           = var.disk_auto_delete
     disk_labels                = merge(local.labels, var.disk_labels)
     disk_size_gb               = var.disk_size_gb
     disk_type                  = var.disk_type
+    disk_storage_pool          = var.disk_storage_pool
     disk_resource_manager_tags = var.disk_resource_manager_tags
     additional_disks           = local.additional_disks
 
@@ -100,7 +123,9 @@ locals {
     enable_oslogin             = var.enable_oslogin
     enable_shielded_vm         = var.enable_shielded_vm
     gpu                        = one(local.guest_accelerator)
-    accelerator_topology       = var.accelerator_topology
+    gpu_count                  = local.gpu_count
+    # Normalize once: util.py has_block_topology() compares against "1x72" exactly.
+    accelerator_topology = var.accelerator_topology == null ? null : lower(trimspace(var.accelerator_topology))
 
     labels                    = local.labels
     machine_type              = var.machine_type
@@ -161,7 +186,7 @@ data "google_compute_zones" "available" {
 }
 
 locals {
-  res_match = regex("^(?P<whole>(?P<prefix>projects/(?P<project>[a-z0-9-]+)/reservations/)?(?P<name>[a-z0-9-]+)(?P<suffix>/reservationBlocks/[a-z0-9-]+)?)?$", var.reservation_name)
+  res_match = regex("^(?P<whole>(?P<prefix>projects/(?P<project>[a-z0-9-]+)/reservations/)?(?P<name>[a-z0-9-]+)(?P<suffix>/reservationBlocks/[a-z0-9-]+(?:/reservationSubBlocks/[a-z0-9-]+)?)?)?$", var.reservation_name)
 
   res_short_name = local.res_match.name
   res_project    = coalesce(local.res_match.project, var.project_id)
