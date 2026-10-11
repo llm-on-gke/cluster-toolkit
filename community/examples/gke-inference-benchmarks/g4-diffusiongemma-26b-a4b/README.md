@@ -26,7 +26,7 @@ Everything the benchmark needs is in this directory:
 
 | File | Purpose |
 | --- | --- |
-| [`blueprint.yaml`](blueprint.yaml) | VPC, service accounts, GKE cluster (Dataplane V2; GCS FUSE, Filestore and Managed Lustre CSI drivers enabled), Spot G4 node pool, the `hf-secret` Kubernetes `Secret` (via the [`kubernetes-secret`](../../../modules/security/kubernetes-secret/README.md) module) and the `kubectl-apply` step that installs the manifests in three stages. |
+| [`blueprint.yaml`](blueprint.yaml) | VPC, service accounts, GKE cluster (Dataplane V2; GCS FUSE, Filestore and Managed Lustre CSI drivers enabled), Spot G4 node pool, the `hf-secret` Kubernetes `Secret` (via the [`kubernetes-secret`](../../../../modules/security/kubernetes-secret/README.md) module) and the `kubectl-apply` step that installs the manifests in three stages. |
 | [`deployment.yaml`](deployment.yaml) | The values you fill in: project, Terraform state bucket, region/zone, authorized CIDR, model weights bucket. |
 | [`manifests/stage-weights.yaml.tftpl`](manifests/stage-weights.yaml.tftpl) | **Stage 1:** Standalone `diffusiongemma-stage-weights` `Job` (enabled when `model_bucket` is set) that checks `gs://<model_bucket>/<model_path>` and stages the Hugging Face snapshot using a rolling per-file download $\to$ concurrent multipart upload $\to$ delete pipeline. |
 | [`manifests/vllm-serve.yaml.tftpl`](manifests/vllm-serve.yaml.tftpl) | **Stage 2:** StorageClass + PersistentVolumeClaim, vLLM `Deployment` (`wait-for-weights` initContainer + server) and `Service`; rendered with `model_bucket`/`model_path`. |
@@ -58,7 +58,7 @@ server manifests additionally take `${model_bucket}` and `${model_path}`.
    measured in `us-central1-b`.
 
 1. **Cluster Toolkit.** Install the
-   [prerequisites](../../../README.md#quickstart), clone this repository and
+   [prerequisites](../../../../README.md#quickstart), clone this repository and
    build the binary with `make`. You also need a GCS bucket for Terraform
    state and the public IP of the machine you deploy from (for example
    `curl -s ifconfig.me`).
@@ -83,8 +83,8 @@ server manifests additionally take `${model_bucket}` and `${model_path}`.
    command line:
 
    ```shell
-   ./gcluster deploy -d examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/deployment.yaml \
-     examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/blueprint.yaml \
+   ./gcluster deploy -d community/examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/deployment.yaml \
+     community/examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/blueprint.yaml \
      --vars hf_token=$HF_TOKEN,model_bucket=$MODEL_BUCKET
    ```
 
@@ -235,7 +235,7 @@ re-create the Job. The manifest is a template with a single expression, so
 ```shell
 kubectl delete job diffusiongemma-vllm-bench
 sed 's/\${hf_secret_name}/hf-secret/' \
-  examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/manifests/vllm-bench.yaml.tftpl | kubectl apply -f -
+  community/examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/manifests/vllm-bench.yaml.tftpl | kubectl apply -f -
 ```
 
 Keep `OUTPUT_LEN` a multiple of 256 (the diffusion canvas) and

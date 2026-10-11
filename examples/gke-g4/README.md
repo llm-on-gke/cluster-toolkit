@@ -79,7 +79,7 @@ Option 1 (Specific Reservation) is uncommented by default in `gke-g4-deployment.
 
 Ready-to-run LLM inference benchmarks for G4 (for example, DiffusionGemma
 26B-A4B served with vLLM on a Spot G4 node pool) live in
-[examples/gke-inference-benchmarks](../gke-inference-benchmarks/README.md). Each
+[community/examples/gke-inference-benchmarks](../../community/examples/gke-inference-benchmarks/README.md). Each
 benchmark is self-contained: one `gcluster deploy` creates the cluster and node
 pool, serves the model and runs the benchmark.
 

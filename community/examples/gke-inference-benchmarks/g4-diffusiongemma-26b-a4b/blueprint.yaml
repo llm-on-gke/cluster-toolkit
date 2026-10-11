@@ -29,8 +29,8 @@
 #
 # Everything this benchmark needs is in this directory; see README.md.
 #
-#   ./gcluster deploy -d examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/deployment.yaml \
-#     examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/blueprint.yaml \
+#   ./gcluster deploy -d community/examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/deployment.yaml \
+#     community/examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/blueprint.yaml \
 #     --vars hf_token=$HF_TOKEN,model_bucket=$MODEL_BUCKET
 
 blueprint_name: gke-inference-benchmark-g4-diffusiongemma

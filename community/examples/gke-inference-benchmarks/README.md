@@ -24,7 +24,7 @@ TPU entries follow the same layout; see [Adding a benchmark](#adding-a-benchmark
 ## Directory layout
 
 ```text
-examples/gke-inference-benchmarks/
+community/examples/gke-inference-benchmarks/
 ├── README.md                         # this catalog
 └── <accelerator>-<model>/            # one self-contained benchmark
     ├── README.md                     # prerequisites, deploy, results, clean up
@@ -44,7 +44,7 @@ for every entry.
 
 ## Running a benchmark
 
-1. Install the [Cluster Toolkit prerequisites](../../README.md#quickstart) and
+1. Install the [Cluster Toolkit prerequisites](../../../README.md#quickstart) and
    build the binary:
 
    ```shell
@@ -56,7 +56,7 @@ for every entry.
    (Spot) quota of that accelerator. Gated models additionally require that
    you accept the model license on Hugging Face and have an access token.
 
-1. Open `examples/gke-inference-benchmarks/<benchmark>/deployment.yaml` and
+1. Open `community/examples/gke-inference-benchmarks/<benchmark>/deployment.yaml` and
    fill in `project_id`, the Terraform state `bucket`, `authorized_cidr` (the
    public IP of the machine you deploy from, as `<ip>/32`) and, if needed,
    `region`/`zone`. The remaining variables have working defaults. Do not put
@@ -67,8 +67,8 @@ for every entry.
    Cloud Storage bucket in which the model weights are kept, see below):
 
    ```shell
-   ./gcluster deploy -d examples/gke-inference-benchmarks/<benchmark>/deployment.yaml \
-     examples/gke-inference-benchmarks/<benchmark>/blueprint.yaml \
+   ./gcluster deploy -d community/examples/gke-inference-benchmarks/<benchmark>/deployment.yaml \
+     community/examples/gke-inference-benchmarks/<benchmark>/blueprint.yaml \
      --vars hf_token=$HF_TOKEN,model_bucket=$MODEL_BUCKET
    ```
 
@@ -96,7 +96,7 @@ New entries are welcome. Keep them uniform so that users can run any benchmark
 with the same commands:
 
 * **Self-contained.** Put everything in
-  `examples/gke-inference-benchmarks/<accelerator>-<model>/` and reference
+  `community/examples/gke-inference-benchmarks/<accelerator>-<model>/` and reference
   manifests from the blueprint with `$(ghpc_stage("manifests/<file>"))`.
   `ghpc_stage` resolves paths relative to the blueprint, so the directory can
   be copied or deployed from any working directory.
@@ -109,7 +109,7 @@ with the same commands:
   `gcluster create` and `terraform validate`.
 * **Secrets through the `kubernetes-secret` module.** Accept tokens as a
   blueprint variable with an empty default and create the Secret with
-  [`modules/security/kubernetes-secret`](../../modules/security/kubernetes-secret/README.md)
+  [`modules/security/kubernetes-secret`](../../../modules/security/kubernetes-secret/README.md)
   (`cluster_id: null` when in the same deployment group as `gke-cluster`),
   which marks the value sensitive. Make the manifests `.tftpl` templates that
   take the Secret name from the module output
@@ -167,8 +167,8 @@ with the same commands:
   keep the weights in Cloud Storage or on a PersistentVolumeClaim so that a
   preempted node recovers quickly. Explain the preemption behaviour in the
   README.
-* **TPU entries.** Start from [`examples/gke-tpu-7x`](../gke-tpu-7x) or
-  [`examples/gke-tpu-v6e`](../gke-tpu-v6e): the node pool takes `machine_type`,
+* **TPU entries.** Start from [`examples/gke-tpu-7x`](../../../examples/gke-tpu-7x) or
+  [`examples/gke-tpu-v6e`](../../../examples/gke-tpu-v6e): the node pool takes `machine_type`,
   `num_slices`, `tpu_topology` and `spot`, and TPU 7x additionally needs the
   `resource-policy` module. Workloads request `google.com/tpu` and select nodes
   with `cloud.google.com/gke-tpu-accelerator` and
@@ -181,7 +181,7 @@ with the same commands:
   model, number of runs) and Clean up.
 * **Wire it into CI and this catalog.** Add a `run_test` line for the new
   `blueprint.yaml`/`deployment.yaml` pair to
-  [`tools/validate_configs/validate_configs.sh`](../../tools/validate_configs/validate_configs.sh)
+  [`tools/validate_configs/validate_configs.sh`](../../../tools/validate_configs/validate_configs.sh)
   (the directory itself is excluded from the generic blueprint scan because it
   also contains Kubernetes manifests), add a row to the [Catalog](#catalog)
   table above, and run `pre-commit run --all-files` before opening a pull
