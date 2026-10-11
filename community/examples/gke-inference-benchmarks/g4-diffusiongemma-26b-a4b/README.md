@@ -332,8 +332,9 @@ client never exceeds the server's sequence budget.
   with the GPU node.
 * When the node is preempted, GKE recreates it (`auto_repair: true`) and the
   `Deployment` reschedules the server. With `model_bucket` set the restart
-  streams the weights from Cloud Storage again (the `stage-weights`
-  initContainer finds them and exits); with it empty the Hugging Face cache on
+  streams the weights from Cloud Storage again (the `wait-for-weights`
+  initContainer finds the staged snapshot and exits at once; the standalone
+  `stage-weights` Job is not re-run); with it empty the Hugging Face cache on
   the `PersistentVolumeClaim` is reused and the weights are reloaded from disk
   (138 s in the reference run). Neither path downloads from Hugging Face again.
 * A benchmark run that is interrupted by a preemption ends with failed
