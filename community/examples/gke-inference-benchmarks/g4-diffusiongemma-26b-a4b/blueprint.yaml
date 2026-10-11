@@ -96,6 +96,20 @@ vars:
   # Set to false to only deploy the vLLM server (no benchmark Job).
   run_benchmark: true
 
+  # Benchmark workload (`vllm bench serve`, random dataset). The values are
+  # embedded in the Job name, so changing one and re-running `gcluster deploy -w`
+  # replaces the Job instead of patching its immutable pod template. Keep
+  # bench_output_len a multiple of 256 (the diffusion canvas) and
+  # bench_max_concurrency at or below the server's --max-num-seqs (8).
+  bench_input_len: 1024
+  bench_output_len: 1024
+  bench_num_prompts: 64
+  bench_max_concurrency: 8
+  # Optional short suffix for the Job name, to repeat a workload with unchanged
+  # parameters (for example bench_run_id: run2). Job names are limited to 63
+  # characters; the default workload uses 48.
+  bench_run_id: ""
+
   system_node_pool_disk_size_gb: 100
   version_prefix: "1.35."
 
@@ -231,10 +245,15 @@ deployment_groups:
   #   2. diffusiongemma-vllm-serve: StorageClass + PVC + Deployment
   #      (wait-for-weights initContainer + vLLM) + Service, rendered with
   #      model_bucket/model_path
-  #   3. diffusiongemma-vllm-bench: `vllm bench serve` Job (only if run_benchmark is true)
+  #   3. diffusiongemma-vllm-bench: `vllm bench serve` Job (only if run_benchmark
+  #      is true), rendered with the bench_* workload variables that are also
+  #      part of the Job name
   # All three reference the Secret by the module's output, which makes Terraform
-  # create the Secret before the pods. JobSet is installed so that
-  # JobSet-based benchmarks can target this cluster too.
+  # create the Secret before the pods. Each manifest is a Helm release managed by
+  # Terraform; do not edit the applied resources by hand (a Job's pod template is
+  # immutable, so change the bench_* variables and re-run `gcluster deploy -w`
+  # instead). JobSet is installed so that JobSet-based benchmarks can target this
+  # cluster too.
   - id: diffusiongemma-vllm
     source: modules/management/kubectl-apply
     use: [g4-cluster]
@@ -264,4 +283,9 @@ deployment_groups:
         source: $(ghpc_stage("manifests/vllm-bench.yaml.tftpl"))
         template_vars:
           hf_secret_name: $(hf-secret.secret_name)
+          bench_input_len: $(vars.bench_input_len)
+          bench_output_len: $(vars.bench_output_len)
+          bench_num_prompts: $(vars.bench_num_prompts)
+          bench_max_concurrency: $(vars.bench_max_concurrency)
+          bench_run_id: '$(vars.bench_run_id != null ? vars.bench_run_id : "")'
         wait_for_rollout: false

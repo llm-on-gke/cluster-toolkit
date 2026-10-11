@@ -80,8 +80,9 @@ for every entry.
    README explains how to supply it with `kubectl patch secret` instead.
 
 1. Follow the benchmark's `README.md` to watch the rollout, read the results
-   (`kubectl logs job/<benchmark job>`) and change the workload parameters
-   (input/output length, number of prompts, concurrency).
+   (`kubectl logs -l app=<benchmark job label>`) and change the workload
+   parameters (`bench_*` variables: input/output length, number of prompts,
+   concurrency) with `gcluster deploy -w`.
 
 1. Clean up. The Terraform state bucket and the weights bucket are not
    deleted:
@@ -148,13 +149,23 @@ with the same commands:
   `storage.bucketViewer`. Keep a disk fallback for an empty `model_bucket`.
 * **Pin and explain every parameter.** Pin the serving image tag and spell out
   the serving flags (parallelism, attention backend, memory utilization, max
-  sequences, max model length) and the benchmark parameters (dataset, ISL/OSL,
-  number of prompts, concurrency) in the manifests, and explain in the README
-  why each non-default value was chosen, so that others can reproduce the
-  numbers and compare like with like.
+  sequences, max model length) in the manifests, expose the benchmark
+  parameters (dataset, ISL/OSL, number of prompts, concurrency) as `bench_*`
+  blueprint variables with the reference values as defaults, and explain in the
+  README why each non-default value was chosen, so that others can reproduce
+  the numbers and compare like with like.
 * **Do not block `gcluster deploy` on model loading.** Use
   `wait_for_rollout: false` for the server and make the benchmark Job wait for
   the server's health endpoint itself.
+* **A benchmark Job that is replaced, never patched.** The `kubectl-apply`
+  module manages every manifest as a Helm release and a Job's pod template is
+  immutable, so pass the `bench_*` variables (plus an optional `bench_run_id`)
+  to the Job manifest through `template_vars` and embed them in the Job name
+  (for example `<model>-vllm-bench-isl1024-osl1024-n64-c8`). A changed
+  parameter then creates a new Job and removes the old one through a normal
+  `gcluster deploy -w`, and users never edit the tracked manifest or re-apply
+  the Job by hand. Give the Job a stable `app` label so that it can be found
+  with `kubectl get jobs -l app=<label>`.
 * **A benchmark Job that cannot hang or report partial numbers.** Give the Job
   an `activeDeadlineSeconds` that covers the server's start-up budget plus a
   few runs, check the result JSON (`completed` equals the number of prompts)

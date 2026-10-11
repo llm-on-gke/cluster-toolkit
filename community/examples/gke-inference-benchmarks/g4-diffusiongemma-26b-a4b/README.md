@@ -134,8 +134,10 @@ server manifests additionally take `${model_bucket}` and `${model_path}`.
      into GPU memory (~44 s). With `model_bucket` empty, `vllm` downloads about
      52 GB of weights to the Hyperdisk volume and loads them (15–25 minutes on
      first start).
-   * **Stage 3 (`job/diffusiongemma-vllm-bench`):** Waits for `/v1/models` on
-     the server and runs `vllm bench serve`.
+   * **Stage 3 (`job -l app=diffusiongemma-vllm-bench`):** Waits for
+     `/v1/models` on the server and runs `vllm bench serve`; the Job name embeds
+     the workload (`diffusiongemma-vllm-bench-isl1024-osl1024-n64-c8` by
+     default).
 
    ```shell
    kubectl logs -f job/diffusiongemma-stage-weights
@@ -208,13 +210,16 @@ distributed deployments and multi-TB models:
 
 ## Benchmark results
 
-The `diffusiongemma-vllm-bench` Job polls `/v1/models` until the server is up,
-then runs `vllm bench serve` with the random dataset, 1024 input / 1024 output
-tokens, 64 prompts, 3 warm-up requests and a maximum concurrency of 8:
+The benchmark Job polls `/v1/models` until the server is up, then runs
+`vllm bench serve` with the random dataset and the workload set by the `bench_*`
+variables (defaults: 1024 input / 1024 output tokens, 64 prompts, 3 warm-up
+requests, maximum concurrency 8). The Job name embeds those values, for example
+`diffusiongemma-vllm-bench-isl1024-osl1024-n64-c8`, so select it by label:
 
 ```shell
-kubectl wait --for=condition=complete job/diffusiongemma-vllm-bench --timeout=60m
-kubectl logs job/diffusiongemma-vllm-bench
+BENCH_JOB=$(kubectl get jobs -l app=diffusiongemma-vllm-bench -o name)
+kubectl wait --for=condition=complete "$BENCH_JOB" --timeout=60m
+kubectl logs "$BENCH_JOB"
 ```
 
 The log contains the usual `vllm bench serve` summary (request throughput,
@@ -225,22 +230,30 @@ requests completed exits non-zero and is retried (`backoffLimit: 3`), and the
 Job gives up after 90 minutes (`activeDeadlineSeconds: 5400`), which covers the
 server's 40-minute start-up budget plus several runs.
 
-To run a different workload, edit the `INPUT_LEN`, `OUTPUT_LEN`, `NUM_PROMPTS`
-and `MAX_CONCURRENCY` environment variables in
-[`manifests/vllm-bench.yaml.tftpl`](manifests/vllm-bench.yaml.tftpl), then
-re-create the Job. The manifest is a template with a single expression, so
-`sed` is enough to render it (a changed Job cannot be re-applied through
-`gcluster deploy` because a Job's pod template is immutable):
+To run a different workload, change `bench_input_len`, `bench_output_len`,
+`bench_num_prompts` or `bench_max_concurrency` (in
+[`deployment.yaml`](deployment.yaml) or with `--vars`) and re-deploy with `-w`,
+which overwrites the deployment directory but keeps the Terraform state. The
+only resource that changes is the benchmark Job and, because its name embeds
+the values, the previous Job is replaced instead of being updated in place
+(a Job's pod template is immutable). Set `bench_run_id` (for example `run2`) to
+repeat a workload with unchanged parameters:
 
 ```shell
-kubectl delete job diffusiongemma-vllm-bench
-sed 's/\${hf_secret_name}/hf-secret/' \
-  community/examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/manifests/vllm-bench.yaml.tftpl | kubectl apply -f -
+./gcluster deploy -w -d community/examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/deployment.yaml \
+  community/examples/gke-inference-benchmarks/g4-diffusiongemma-26b-a4b/blueprint.yaml \
+  --vars hf_token=$HF_TOKEN,model_bucket=$MODEL_BUCKET,bench_input_len=2048,bench_output_len=512,bench_num_prompts=128,bench_max_concurrency=8
 ```
 
-Keep `OUTPUT_LEN` a multiple of 256 (the diffusion canvas) and
-`MAX_CONCURRENCY` at or below the server's `--max-num-seqs` (8), otherwise
+Keep `bench_output_len` a multiple of 256 (the diffusion canvas) and
+`bench_max_concurrency` at or below the server's `--max-num-seqs` (8), otherwise
 requests queue inside the server and latency numbers stop being meaningful.
+
+> **Note:** do not edit [`manifests/vllm-bench.yaml.tftpl`](manifests/vllm-bench.yaml.tftpl)
+> of a running deployment or re-apply the Job by hand. The manifests are managed
+> as Helm releases by the `kubectl-apply` module, and a Job whose pod template
+> was changed behind Helm's back makes a later `gcluster deploy` fail on the
+> immutable pod template until that Job is deleted.
 
 To deploy only the server (no Job), set `run_benchmark: false` in
 [`deployment.yaml`](deployment.yaml).

@@ -74,3 +74,15 @@ vars:
 
   # Set to false to only deploy the vLLM server (no benchmark Job).
   run_benchmark: true
+
+  # Benchmark workload (random dataset): input/output tokens per request,
+  # number of prompts and client concurrency. Keep bench_output_len a multiple
+  # of 256 and bench_max_concurrency <= 8 (the server's --max-num-seqs). The
+  # values are part of the Job name, so changing them here or with --vars and
+  # re-running `gcluster deploy -w` replaces the Job; set bench_run_id (for
+  # example run2) to repeat a workload with unchanged parameters.
+  bench_input_len: 1024
+  bench_output_len: 1024
+  bench_num_prompts: 64
+  bench_max_concurrency: 8
+  bench_run_id: ""
